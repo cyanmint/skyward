@@ -1,6 +1,6 @@
-use crate::app::Touch;
+//! Pure touch/display mapping shared by the Android input adapter and host tests.
 
-/// Pure touch/display mapping shared by the Android input adapter and host tests.
+use crate::app::Touch;
 
 /// Whether a touch event begins a gesture and may request a panel switch.
 pub fn is_touch_start(touch: Touch) -> bool {
