@@ -158,6 +158,9 @@ enum Cmd {
     /// directory, such as android.hardware.security.keymint.IKeyMintDevice/default.
     #[cfg(target_os = "android")]
     Service { name: String },
+    /// List static sensors from the default vendor Sensors AIDL service.
+    #[cfg(target_os = "android")]
+    Sensors,
     /// Report the phone's key service and, given a key directory Android
     /// wrote, unwrap the key it holds and say how long it is.
     #[cfg(target_os = "android")]
@@ -321,6 +324,14 @@ fn main() -> Result<()> {
                 None => "not registered",
             };
             println!("{name} is {described} and {running}");
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::Sensors => {
+            let binder = skyward_binder::driver::Binder::open()?;
+            for sensor in skyward_binder::sensors::list(&binder)? {
+                println!("{} type={} {} ({}) [{}]", sensor.handle, sensor.sensor_type, sensor.name, sensor.vendor, sensor.type_as_string);
+            }
             Ok(())
         }
         #[cfg(target_os = "android")]
