@@ -1,8 +1,11 @@
 use crate::parcel::Reader;
 use anyhow::{ensure, Context, Result};
 
+#[cfg(target_os = "android")]
 const INTERFACE: &str = "android.hardware.sensors.ISensors";
+#[cfg(target_os = "android")]
 const SERVICE: &str = "android.hardware.sensors.ISensors/default";
+#[cfg(target_os = "android")]
 const GET_SENSORS_LIST: u32 = 5;
 const MAX_SENSORS: i32 = 512;
 
