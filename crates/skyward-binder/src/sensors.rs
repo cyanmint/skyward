@@ -7,7 +7,6 @@ const INTERFACE: &str = "android.hardware.sensors.ISensors";
 const SERVICE: &str = "android.hardware.sensors.ISensors/default";
 #[cfg(target_os = "android")]
 const GET_SENSORS_LIST: u32 = 5;
-const MAX_SENSORS: i32 = 512;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct SensorInfo {
@@ -27,8 +26,14 @@ pub fn parse_sensor_list(data: &[u8]) -> Result<Vec<SensorInfo>> {
         .i32()
         .context("read how many sensors the HAL returned")?;
     ensure!(
-        (0..=MAX_SENSORS).contains(&count),
-        "the Sensors HAL returned an implausible count of {count}"
+        count >= 0,
+        "the Sensors HAL returned a negative sensor count of {count}"
+    );
+    let remaining = data.len().saturating_sub(read.here());
+    ensure!(
+        count as usize <= remaining / 12,
+        "the Sensors HAL claims {count} sensors, which cannot fit in its {}-byte reply",
+        data.len()
     );
 
     let mut sensors = Vec::with_capacity(count as usize);
@@ -67,6 +72,11 @@ pub fn parse_sensor_list(data: &[u8]) -> Result<Vec<SensorInfo>> {
             type_as_string,
         });
     }
+    ensure!(
+        read.here() == data.len(),
+        "the Sensors HAL reply has {} trailing bytes",
+        data.len() - read.here()
+    );
     Ok(sensors)
 }
 
@@ -135,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn sensor_list_rejects_implausible_vector_counts() {
+    fn sensor_list_rejects_counts_that_cannot_fit_the_reply() {
         let mut reply = Parcel::default();
         reply.i32(0); // AIDL exception: none.
         reply.i32(513);
