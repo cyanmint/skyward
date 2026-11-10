@@ -20,6 +20,7 @@ pub mod sprite;
 pub mod surface;
 pub mod term;
 pub mod theme;
+pub mod touch;
 pub mod widgets;
 
 pub use app::App;

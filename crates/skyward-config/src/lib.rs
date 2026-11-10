@@ -308,6 +308,17 @@ impl Default for Modules {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TouchPanel {
+    /// Name reported by evdev for this touchscreen.
+    pub device: String,
+    /// Display index used by the panel's DRM connector and UI layout.
+    pub display_index: u32,
+    /// Preferred mode dimensions on that display.
+    pub width: u32,
+    pub height: u32,
+}
+
 /// The touchscreen, on phones whose touch controller is to be told
 /// something before a recovery can read touches from it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -317,6 +328,9 @@ pub struct Touch {
     /// step of starting the controller.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// Touchscreens and the display each one belongs to on foldables.
+    #[serde(default)]
+    pub panels: Vec<TouchPanel>,
 }
 
 /// Partitions as the phone itself mounts them.
@@ -503,6 +517,20 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        let mut touch_devices = Vec::new();
+        let mut touch_displays = Vec::new();
+        for panel in &cfg.touch.panels {
+            ensure!(!panel.device.is_empty(), "[touch] panels: device name is empty");
+            ensure!(panel.width > 0 && panel.height > 0, "[touch] panels: {} has zero display size", panel.device);
+            ensure!(!touch_devices.contains(&panel.device.as_str()), "[touch] panels: {} is listed more than once", panel.device);
+            ensure!(
+                !touch_displays.contains(&panel.display_index),
+                "[touch] panels: display index {} is listed more than once",
+                panel.display_index
+            );
+            touch_devices.push(panel.device.as_str());
+            touch_displays.push(panel.display_index);
+        }
         for log in &cfg.wipe.logs {
             let path = Path::new(log);
             let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
@@ -686,6 +714,17 @@ mod tests {
             assert!(with(&format!("user = \"system\"\ngroup = \"system\"\nmode = 0o664\npaths = [\"{bad}\"]")).is_err(), "{bad} is refused");
         }
         assert!(DeviceConfig::parse("[device]\ncodename = \"x\"\n").unwrap().owners.is_empty(), "a phone may need none");
+    }
+
+    #[test]
+    fn ruyi_declares_each_touchscreen_with_its_display() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        assert_eq!(config.touch.panels.len(), 2);
+        assert_eq!(
+            config.touch.panels[0],
+            TouchPanel { device: "synaptics_tcm_touch".into(), display_index: 0, width: 1224, height: 2912 }
+        );
+        assert_eq!(config.touch.panels[1], TouchPanel { device: "goodix_ts".into(), display_index: 1, width: 1208, height: 1392 });
     }
 
     #[test]

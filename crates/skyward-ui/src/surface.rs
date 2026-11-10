@@ -14,6 +14,67 @@ pub trait Surface {
     fn settle(&mut self) -> Result<()>;
 }
 
+/// Keep a display-reopen retry deadline from being postponed by repeated
+/// requests received while the UI loop is waiting for a panel to return.
+pub fn retain_retry_deadline(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    deadline.unwrap_or(now)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn requested_dsi_connector(connected_ids: &[u32], requested_display: u32) -> Option<u32> {
+    requested_display
+        .checked_add(1)
+        .filter(|requested| connected_ids.contains(requested))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn preflight_switch<T>(
+    surface: T,
+    connected_ids: Result<Vec<u32>>,
+    requested_display: u32,
+) -> std::result::Result<(T, bool), (T, anyhow::Error)> {
+    match connected_ids {
+        Ok(ids) => Ok((
+            surface,
+            requested_dsi_connector(&ids, requested_display).is_some(),
+        )),
+        Err(error) => Err((surface, error)),
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn select_dsi_connector(connected_ids: &[u32], requested_display: u32) -> Option<u32> {
+    requested_dsi_connector(connected_ids, requested_display)
+        .or_else(|| connected_ids.iter().copied().min())
+}
+
+#[cfg(any(target_os = "android", test))]
+type PanelIdentity = (u32, u32);
+
+#[cfg(any(target_os = "android", test))]
+fn is_requested_dsi(
+    identity: PanelIdentity,
+    requested_display: u32,
+    dsi_interface: u32,
+) -> bool {
+    requested_display
+        .checked_add(1)
+        .is_some_and(|interface_id| identity == (dsi_interface, interface_id))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn reopened_panel_changed(
+    previous_identity: PanelIdentity,
+    previous_size: (u32, u32),
+    active_identity: PanelIdentity,
+    active_size: (u32, u32),
+) -> bool {
+    previous_identity != active_identity || previous_size != active_size
+}
+
 /// How Qualcomm's display driver drives a mode, from the text of the
 /// connector's mode_properties blob: key=value lines, a block per mode_name.
 #[cfg(any(target_os = "android", test))]
@@ -196,6 +257,67 @@ mod tests {
         assert_eq!(SdeMode::find(ISHTAR, "1440x3200x120cmd").unwrap(), SdeMode { mixers: 2, dsc: true });
         assert_eq!(SdeMode::find(ISHTAR, "1080x2400x60cmd").unwrap(), SdeMode { mixers: 1, dsc: false });
         assert!(SdeMode::find(ISHTAR, "1440x3200x90cmd").is_err());
+    }
+
+    #[test]
+    fn selects_the_requested_dsi_connector_and_falls_back_to_connected_panel() {
+        assert_eq!(select_dsi_connector(&[2, 1], 1), Some(2));
+        assert_eq!(select_dsi_connector(&[2, 1], 0), Some(1));
+        assert_eq!(select_dsi_connector(&[1], 1), Some(1));
+        assert_eq!(select_dsi_connector(&[], 0), None);
+    }
+
+    #[test]
+    fn retry_deadline_is_not_moved_later_by_repeated_requests() {
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_millis(250);
+        assert_eq!(retain_retry_deadline(Some(deadline), now), deadline);
+        assert_eq!(retain_retry_deadline(None, now), now);
+    }
+
+    #[test]
+    fn non_dsi_panel_does_not_match_a_dsi_display_with_the_same_logical_index() {
+        assert!(is_requested_dsi((1, 1), 0, 1));
+        assert!(!is_requested_dsi((2, 0), 0, 1));
+        assert!(!is_requested_dsi((1, 1), u32::MAX, 1));
+    }
+
+    #[test]
+    fn fallback_to_different_connected_panel_requires_ui_resize() {
+        assert!(reopened_panel_changed((0, 1), (1224, 2912), (0, 2), (1208, 1392)));
+        assert!(!reopened_panel_changed((0, 1), (1224, 2912), (0, 1), (1224, 2912)));
+    }
+
+    #[test]
+    fn restore_open_fallback_to_another_panel_reports_a_change() {
+        assert!(reopened_panel_changed((0, 1), (1224, 2912), (0, 2), (1208, 1392)));
+        assert!(!reopened_panel_changed((0, 1), (1224, 2912), (0, 1), (1224, 2912)));
+    }
+
+    #[test]
+    fn switching_between_different_connector_types_with_same_logical_index_resizes() {
+        // Both connectors have logical display index 0, but not the same
+        // physical panel or geometry.
+        assert!(reopened_panel_changed((1, 0), (1224, 2912), (2, 0), (1280, 720)));
+        assert!(reopened_panel_changed((1, 0), (1224, 2912), (1, 0), (1208, 1392)));
+    }
+
+    #[test]
+    fn connector_query_error_returns_the_current_surface() {
+        let (surface, error) = preflight_switch(
+            42,
+            Err(anyhow::anyhow!("query failed")),
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(surface, 42);
+        assert!(error.to_string().contains("query failed"));
+    }
+
+    #[test]
+    fn unavailable_requested_panel_is_detected_before_modeset() {
+        assert_eq!(requested_dsi_connector(&[1], 1), None);
+        assert_eq!(requested_dsi_connector(&[1, 2], 1), Some(2));
     }
 }
 
@@ -479,6 +601,9 @@ pub mod kms {
 
     pub struct KmsSurface {
         card: Card,
+        path: String,
+        display_index: u32,
+        panel_identity: PanelIdentity,
         bufs: [Buf; 3],
         /// The buffer the next frame goes into.
         back: usize,
@@ -515,19 +640,35 @@ pub mod kms {
     }
 
     impl KmsSurface {
-        pub fn open(path: &str) -> Result<Self> {
+        pub fn open(path: &str, requested_display: u32) -> Result<Self> {
             let card = open_card(path)?;
             let res = card.resource_handles().context("read KMS resources")?;
 
-            let mut panel = None;
+            let mut dsi_panels = Vec::new();
+            let mut other_panels = Vec::new();
             for &h in res.connectors() {
                 let info = card.get_connector(h, true).context("read connector")?;
                 if is_panel(info.interface()) && info.state() == connector::State::Connected {
-                    panel = Some(info);
-                    break;
+                    if info.interface() == connector::Interface::DSI {
+                        dsi_panels.push(info.clone());
+                    }
+                    other_panels.push(info);
                 }
             }
-            let conn = panel.ok_or_else(|| anyhow!("no connected built-in panel"))?;
+            dsi_panels.sort_by_key(|info| info.interface_id());
+            other_panels.sort_by_key(|info| (info.interface() as u32, info.interface_id()));
+            let connected_ids: Vec<u32> = dsi_panels.iter().map(|info| info.interface_id()).collect();
+            let selected_id = super::select_dsi_connector(&connected_ids, requested_display);
+            let conn = selected_id
+                .and_then(|id| dsi_panels.iter().find(|info| info.interface_id() == id).cloned())
+                .or_else(|| other_panels.first().cloned())
+                .ok_or_else(|| anyhow!("no connected built-in panel"))?;
+            let panel_identity = (conn.interface() as u32, conn.interface_id());
+            let display_index = if conn.interface() == connector::Interface::DSI {
+                conn.interface_id().saturating_sub(1)
+            } else {
+                0
+            };
             let preferred = conn
                 .modes()
                 .iter()
@@ -730,6 +871,9 @@ pub mod kms {
             let conn = conn.handle();
             let s = KmsSurface {
                 card,
+                path: path.to_owned(),
+                display_index,
+                panel_identity,
                 bufs,
                 back: 1,
                 flipping: false,
@@ -751,6 +895,110 @@ pub mod kms {
             };
             s.to_fastest()?;
             Ok(s)
+        }
+
+        pub fn display_index(&self) -> u32 {
+            self.display_index
+        }
+
+        pub fn panel_identity(&self) -> (u32, u32) {
+            self.panel_identity
+        }
+
+        pub fn is_dsi_display(&self, requested_display: u32) -> bool {
+            super::is_requested_dsi(
+                self.panel_identity,
+                requested_display,
+                connector::Interface::DSI as u32,
+            )
+        }
+
+        /// Reopen KMS on another built-in panel. The current surface is shut
+        /// down first so its DRM master is released before the new modeset.
+        /// An unavailable target or a failed shutdown keeps the current surface;
+        /// a failed modeset lets the caller retry without blocking its event loop.
+        pub fn switch_to(mut self, requested_display: u32) -> Result<(Self, bool)> {
+            if self.is_dsi_display(requested_display) {
+                return Ok((self, false));
+            }
+            let (path, previous, previous_identity, previous_size) =
+                (self.path.clone(), self.display_index, self.panel_identity, self.size());
+            let connected_ids = (|| -> Result<Vec<u32>> {
+                let resources = self
+                    .card
+                    .resource_handles()
+                    .context("read KMS resources before display switch")?;
+                let mut connected_ids = Vec::new();
+                for &handle in resources.connectors() {
+                    let connector = self
+                        .card
+                        .get_connector(handle, true)
+                        .context("read connector before display switch")?;
+                    if connector.interface() == connector::Interface::DSI
+                        && connector.state() == connector::State::Connected
+                    {
+                        connected_ids.push(connector.interface_id());
+                    }
+                }
+                Ok(connected_ids)
+            })();
+            let (surface, connected) =
+                match super::preflight_switch(self, connected_ids, requested_display) {
+                    Ok(result) => result,
+                    Err((surface, error)) => {
+                        eprintln!(
+                            "could not inspect connectors for display {requested_display}: {error:#}; keeping display {previous}"
+                        );
+                        return Ok((surface, false));
+                    }
+                };
+            self = surface;
+            if !connected {
+                eprintln!("requested display {requested_display} is not connected; keeping display {previous}");
+                return Ok((self, false));
+            }
+            if let Err(error) = self.turn_off() {
+                eprintln!(
+                    "could not turn off display {previous} to switch to {requested_display}: {error:#}; keeping the current surface"
+                );
+                return Ok((self, false));
+            }
+            drop(self);
+            match Self::open(&path, requested_display) {
+                Ok(next) => {
+                    let changed = super::reopened_panel_changed(
+                        previous_identity,
+                        previous_size,
+                        next.panel_identity,
+                        next.size(),
+                    );
+                    if next.display_index != requested_display {
+                        eprintln!(
+                            "requested display {requested_display} is unavailable; using connected display {}",
+                            next.display_index
+                        );
+                    }
+                    Ok((next, changed))
+                }
+                Err(switch_error) => match Self::open(&path, previous) {
+                    Ok(previous_panel) => {
+                        let changed = super::reopened_panel_changed(
+                            previous_identity,
+                            previous_size,
+                            previous_panel.panel_identity,
+                            previous_panel.size(),
+                        );
+                        eprintln!(
+                            "switch to {requested_display} failed: {switch_error:#}; reopened {} (was {previous})",
+                            previous_panel.display_index
+                        );
+                        Ok((previous_panel, changed))
+                    }
+                    Err(restore_error) => Err(anyhow!(
+                        "switch {requested_display} failed ({switch_error:#}); restore {previous} failed ({restore_error:#})"
+                    )),
+                },
+            }
         }
 
         pub fn describe(&self) -> &str {

@@ -1051,10 +1051,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     }
     let mut info = skyward_info::collect(cfg)?;
     let fonts = Fonts::load(font, 0, mono)?;
-    let mut surface = KmsSurface::open("/dev/dri/card0")?;
-    let (w, h) = surface.size();
+    let surface = KmsSurface::open("/dev/dri/card0", 0)?;
+    let (mut w, mut h) = surface.size();
+    let mut active_panel = surface.panel_identity();
     eprintln!("display {}", surface.describe());
-    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
+    let mut surface = Some(surface);
+    let mut reopen_display = None;
+    let mut reopen_at: Option<Instant> = None;
+    let mut reopen_attempts = 0u32;
+    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone(), cfg.touch.panels.clone())?;
     let started = Instant::now();
     let mut touch_known = false;
     // adbd and fastbootd ask over it to go over to fastboot and back.
@@ -1374,6 +1379,39 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let mut drive_at = Instant::now();
     loop {
         let now = monotonic_ms();
+        if surface.is_none() && reopen_at.is_some_and(|at| Instant::now() >= at) {
+            let requested = reopen_display.unwrap_or(0);
+            match KmsSurface::open("/dev/dri/card0", requested) {
+                Ok(restored) => {
+                    let identity = restored.panel_identity();
+                    let size = restored.size();
+                    if identity != active_panel || size != (w, h) {
+                        active_panel = identity;
+                        (w, h) = size;
+                        inputs.set_size(w, h);
+                        app.resize(w, h);
+                        screen = Canvas::new(w, h);
+                        Canvas::keep_ready(w, h, 3);
+                        touch_known = false;
+                    }
+                    app.redraw();
+                    blanked = false;
+                    rested_at = None;
+                    eprintln!("reopened display {}", restored.describe());
+                    surface = Some(restored);
+                    reopen_display = None;
+                    reopen_at = None;
+                    reopen_attempts = 0;
+                }
+                Err(error) => {
+                    reopen_attempts = reopen_attempts.saturating_add(1);
+                    if reopen_attempts == 1 || reopen_attempts.is_power_of_two() {
+                        eprintln!("could not reopen a connected display: {error:#}; retrying");
+                    }
+                    reopen_at = Some(Instant::now() + Duration::from_millis(250));
+                }
+            }
+        }
         if leave_at.is_some_and(|at| now >= at) {
             leave_at = None;
             power(leave)?;
@@ -1439,52 +1477,58 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             app.set_fastboot(running, link);
             port_at = Instant::now();
         }
-        let panel = app.panel(now);
+        let panel = if surface.is_some() { app.panel(now) } else { None };
         let mut shown = false;
-        if panel.is_some() {
-            // A display turned off comes on again with a frame drawn for it.
-            if app.take_dirty() || !surface.is_on() {
-                let t0 = Instant::now();
-                app.compose(&mut screen, &fonts, &info, &shown_clock, now);
-                surface.present(&screen)?;
-                eprintln!("frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
-                if let Some(path) = dump {
-                    fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
+        if let Some(surface) = surface.as_mut() {
+            if panel.is_some() {
+                // A display turned off comes on again with a frame drawn for it.
+                if app.take_dirty() || !surface.is_on() {
+                    let t0 = Instant::now();
+                    app.compose(&mut screen, &fonts, &info, &shown_clock, now);
+                    surface.present(&screen)?;
+                    eprintln!("frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
+                    if let Some(path) = dump {
+                        fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
+                    }
+                    shown = true;
                 }
-                shown = true;
+                blanked = false;
+            } else if !blanked {
+                // Black out the panel's frame memory before the backlight goes
+                // to 0 and the display off, so an OLED that floors the backlight
+                // above zero rather than cutting it shows nothing as it goes off.
+                screen.data.fill(0);
+                surface.present(&screen)?;
+                surface.settle()?;
+                blanked = true;
             }
+            // After the frame is on the panel, so a panel coming back on lights
+            // with what it should show now, never with what it showed when it
+            // went off.
+            if backlight.level == 0 && panel.is_some() {
+                surface.settle()?;
+            }
+            if panel.is_some() {
+                // Lit, a panel that came on again switches to its fastest
+                // refresh.
+                surface.speed_up()?;
+                rested_at = None;
+            } else if surface.is_on() {
+                // With the backlight off, the panel rests, and the touch
+                // controller following it stops drawing power.
+                surface.rest()?;
+                rested_at = Some(Instant::now());
+            } else if rested_at.is_some_and(|at| at.elapsed() >= REST) {
+                // Rested long enough, the display goes off: the panel and the
+                // display processor feeding it stop drawing power.
+                surface.turn_off()?;
+                rested_at = None;
+            }
+            backlight.show(panel)?;
+        } else {
             blanked = false;
-        } else if !blanked {
-            // Black out the panel's frame memory before the backlight goes
-            // to 0 and the display off, so an OLED that floors the backlight
-            // above zero rather than cutting it shows nothing as it goes off.
-            screen.data.fill(0);
-            surface.present(&screen)?;
-            surface.settle()?;
-            blanked = true;
-        }
-        // After the frame is on the panel, so a panel coming back on lights
-        // with what it should show now, never with what it showed when it
-        // went off.
-        if backlight.level == 0 && panel.is_some() {
-            surface.settle()?;
-        }
-        backlight.show(panel)?;
-        if panel.is_some() {
-            // Lit, a panel that came on again switches to its fastest
-            // refresh.
-            surface.speed_up()?;
             rested_at = None;
-        } else if surface.is_on() {
-            // With the backlight off, the panel rests, and the touch
-            // controller following it stops drawing power.
-            surface.rest()?;
-            rested_at = Some(Instant::now());
-        } else if rested_at.is_some_and(|at| at.elapsed() >= REST) {
-            // Rested long enough, the display goes off: the panel and the
-            // display processor feeding it stop drawing power.
-            surface.turn_off()?;
-            rested_at = None;
+            backlight.show(None)?;
         }
         // A page at rest draws the rows it has yet to while nothing else
         // is to be done, a band at a time, looking for input between bands.
@@ -1496,7 +1540,17 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         let until_due = app.deadline(now).map(|d| d.saturating_sub(now) as i32);
         // A resting panel turns off once its rest is over.
         let rest_left = rested_at.map(|at| REST.saturating_sub(at.elapsed()).as_millis() as i32);
-        let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).min().map_or(1000, |t| t.clamp(floor, 1000)) };
+        let retry_left = reopen_at.map(|at| at.saturating_duration_since(Instant::now()).as_millis() as i32);
+        let timeout = if ahead {
+            0
+        } else {
+            until_due
+                .into_iter()
+                .chain(rest_left)
+                .chain(retry_left)
+                .min()
+                .map_or(1000, |t| t.clamp(floor, 1000))
+        };
         // With the display off, the phone sleeps unless something needs it
         // awake: work under way, fastboot or sideload, a restart on its way,
         // a command running in the terminal, a network being joined, the
@@ -1521,7 +1575,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             Some(sh) => !sh.waiting()?,
             None => false,
         };
-        let may_sleep = surface.is_off()
+        let may_sleep = surface.as_ref().is_some_and(|surface| surface.is_off())
+            && reopen_at.is_none()
             && !busy
             && !fastboot
             && !sideloading
@@ -2116,7 +2171,59 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
                     answer(asked, fastboot)
                 }
-                Incoming::Input(Event::Touch(t, at)) => app.touch(t, &fonts, at),
+                Incoming::Input(Event::Touch(t, at, target)) => {
+                    let mut belongs_to_active = target.is_none();
+                    if let Some(target) = target {
+                        if skyward_ui::touch::is_touch_start(t) {
+                            match surface.as_ref() {
+                                Some(active) if !active.is_dsi_display(target.display_index) => {
+                                    let Some(current) = surface.take() else {
+                                        unreachable!("an active display was observed before taking it")
+                                    };
+                                    match current.switch_to(target.display_index) {
+                                        Ok((next, switched)) => {
+                                            if switched {
+                                                active_panel = next.panel_identity();
+                                                (w, h) = next.size();
+                                                inputs.set_size(w, h);
+                                                app.resize(w, h);
+                                                screen = Canvas::new(w, h);
+                                                Canvas::keep_ready(w, h, 3);
+                                                touch_known = false;
+                                                blanked = false;
+                                                rested_at = None;
+                                                eprintln!("switched display: {}", next.describe());
+                                            }
+                                            surface = Some(next);
+                                        }
+                                        Err(error) => {
+                                            eprintln!("display switch failed; keeping recovery services live: {error:#}");
+                                            reopen_display = Some(target.display_index);
+                                            reopen_at = Some(Instant::now());
+                                            reopen_attempts = 0;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    reopen_display = Some(target.display_index);
+                                    reopen_at = Some(skyward_ui::surface::retain_retry_deadline(
+                                        reopen_at,
+                                        Instant::now(),
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                        belongs_to_active = surface
+                            .as_ref()
+                            .is_some_and(|active| active.is_dsi_display(target.display_index));
+                    }
+                    if belongs_to_active {
+                        app.touch(t, &fonts, at)
+                    } else {
+                        Vec::new()
+                    }
+                }
                 Incoming::Input(Event::Key(k, true)) => app.key(k, now),
                 Incoming::Input(Event::Key(k, false)) => app.key_up(k, now),
             };

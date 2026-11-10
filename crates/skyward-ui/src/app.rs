@@ -3263,6 +3263,47 @@ impl App {
         self.dirty = true;
     }
 
+    /// The active panel changed; keep application state and navigation, but
+    /// discard geometry-dependent render state before drawing the new size.
+    pub fn resize(&mut self, w: u32, h: u32) {
+        if (self.w, self.h) == (w, h) {
+            return;
+        }
+        self.w = w;
+        self.h = h;
+        self.frame = None;
+        self.stale.clear();
+        self.spots = None;
+        self.knob = None;
+        self.row_art = None;
+        self.shown = None;
+        self.layer = None;
+        self.turn = None;
+        self.backdrop = None;
+        self.drawn.clear();
+        self.spare.clear();
+        self.titles = None;
+        self.search_words = None;
+        self.chip = None;
+        self.button_chip = None;
+        self.dither = None;
+        self.charge_art = None;
+        self.charge_canvas = None;
+        self.row_press = None;
+        self.morph = None;
+        self.drag = Drag::Idle;
+        self.tracker = Tracker::default();
+        self.seek = None;
+        self.fling = None;
+        self.glide = None;
+        self.pull = 0.0;
+        self.bounce = None;
+        self.height = 0.0;
+        self.cols = 0;
+        self.snap = true;
+        self.dirty = true;
+    }
+
     /// What the page shows changed only in rows `first..end`: draw those
     /// again, and the rest stays as drawn.
     fn refresh_rows(&mut self, first: u32, end: u32) {
@@ -11645,5 +11686,19 @@ mod tests {
         assert_eq!(app.deadline(1000), Some(12_000));
         app.tick(15_000);
         assert!(!app.display_on());
+    }
+
+    #[test]
+    fn resizing_keeps_the_current_screen_and_game_state() {
+        let (f, info) = (fonts(), info());
+        let mut app = App::new(Screen::Home, 1224, 2912, 520.0 / 160.0);
+        app.state.language_chosen = true;
+        app.frame(&f, &info);
+        app.resize(1208, 1392);
+        assert_eq!((app.w, app.h), (1208, 1392));
+        assert_eq!(app.screen(), Screen::Home);
+        assert!(app.state.language_chosen);
+        assert!(app.dirty);
+        assert_eq!(app.frame(&f, &info).canvas.w, 1208, "the page geometry is rebuilt for the new panel width");
     }
 }

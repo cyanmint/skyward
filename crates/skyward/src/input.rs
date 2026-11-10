@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use evdev::raw_stream::RawDevice;
 use evdev::{AbsoluteAxisCode, EventSummary, InputEvent, KeyCode, PropType, SynchronizationCode};
-use skyward_config::Write;
+use skyward_config::{TouchPanel, Write};
 use skyward_sys::sleep::Wakeful;
 use skyward_ui::app::{Key, Touch};
 use std::collections::HashSet;
@@ -12,8 +12,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 pub enum Event {
-    /// A touch and when the panel reported it, on [`monotonic_ms`]'s clock.
-    Touch(Touch, u64),
+    /// A touch and when the panel reported it, on [`monotonic_ms`]'s clock,
+    /// with the display that touchscreen belongs to when known.
+    Touch(Touch, u64, Option<TouchPanel>),
     /// A button going down, or coming back up.
     Key(Key, bool),
 }
@@ -71,6 +72,7 @@ fn slot0_value(dev: &RawDevice, axis: AbsoluteAxisCode, slots: usize) -> io::Res
 struct Panel {
     dev: RawDevice,
     path: PathBuf,
+    target: Option<TouchPanel>,
     x_range: (i32, i32),
     y_range: (i32, i32),
     slots: usize,
@@ -85,7 +87,7 @@ struct Panel {
 }
 
 impl Panel {
-    fn new(path: PathBuf, dev: RawDevice) -> Result<Self> {
+    fn new(path: PathBuf, dev: RawDevice, target: Option<TouchPanel>) -> Result<Self> {
         let mut x_range = None;
         let mut y_range = None;
         let mut slots = 1;
@@ -108,8 +110,20 @@ impl Panel {
             return Err(io::Error::last_os_error()).context("stamp touch events with the monotonic clock");
         }
         set_nonblocking(dev.as_raw_fd()).context("make touch non-blocking")?;
-        let mut panel =
-            Panel { dev, path, x_range, y_range, slots, slot: 0, down: false, was_down: false, raw: (0, 0), moved: false, dropped: false };
+        let mut panel = Panel {
+            dev,
+            path,
+            target,
+            x_range,
+            y_range,
+            slots,
+            slot: 0,
+            down: false,
+            was_down: false,
+            raw: (0, 0),
+            moved: false,
+            dropped: false,
+        };
         // The kernel drops a position equal to the one a slot already holds,
         // so a touch landing where the last one lifted carries no position;
         // start from what the panel holds now.
@@ -146,13 +160,14 @@ impl Panel {
                     }
                     let time = e.as_ref().time;
                     let at = time.tv_sec as u64 * 1000 + time.tv_usec as u64 / 1000;
-                    let span = |r: (i32, i32)| (r.1 - r.0).max(1) as f32;
-                    let x = (self.raw.0 - self.x_range.0) as f32 / span(self.x_range) * w;
-                    let y = (self.raw.1 - self.y_range.0) as f32 / span(self.y_range) * h;
+                    let target = self.target.clone();
+                    let (target_w, target_h) = target.as_ref().map_or((w as u32, h as u32), |p| (p.width, p.height));
+                    let x = skyward_ui::touch::map_axis(self.raw.0, self.x_range, target_w);
+                    let y = skyward_ui::touch::map_axis(self.raw.1, self.y_range, target_h);
                     match (self.was_down, self.down) {
-                        (false, true) => out.push(Event::Touch(Touch::Down(x, y), at)),
-                        (true, true) if self.moved => out.push(Event::Touch(Touch::Move(x, y), at)),
-                        (true, false) => out.push(Event::Touch(Touch::Up, at)),
+                        (false, true) => out.push(Event::Touch(Touch::Down(x, y), at, target.clone())),
+                        (true, true) if self.moved => out.push(Event::Touch(Touch::Move(x, y), at, target.clone())),
+                        (true, false) => out.push(Event::Touch(Touch::Up, at, target)),
                         _ => {}
                     }
                     self.was_down = self.down;
@@ -176,6 +191,11 @@ impl Panel {
     }
 }
 
+fn target_for_device(name: &str, panels: &[TouchPanel]) -> Option<TouchPanel> {
+    let display = skyward_ui::touch::display_for_device(name, panels.iter().map(|panel| (panel.device.as_str(), panel.display_index)))?;
+    panels.iter().find(|panel| panel.display_index == display).cloned()
+}
+
 /// The touchscreen and the hardware buttons. /dev/input is watched, so a
 /// device that shows up later, such as a touch panel whose driver module
 /// loads after the UI starts, is picked up when it appears.
@@ -184,17 +204,20 @@ pub struct Inputs {
     /// The watch and every device taken in: a touch or a key press keeps
     /// the phone awake until it is read.
     wakeful: Wakeful,
-    panel: Option<Panel>,
+    panels: Vec<Panel>,
     buttons: Vec<(PathBuf, RawDevice)>,
     seen: HashSet<PathBuf>,
     /// What the touchscreen is told each time its panel is taken in.
     touch_writes: Vec<Write>,
+    /// The configured touchscreen-to-display relationship, empty on devices
+    /// with a single display.
+    touch_panels: Vec<TouchPanel>,
     w: f32,
     h: f32,
 }
 
 impl Inputs {
-    pub fn open(w: u32, h: u32, touch_writes: Vec<Write>) -> Result<Self> {
+    pub fn open(w: u32, h: u32, touch_writes: Vec<Write>, touch_panels: Vec<TouchPanel>) -> Result<Self> {
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error()).context("create inotify instance");
@@ -211,24 +234,24 @@ impl Inputs {
         let mut inputs = Inputs {
             watch,
             wakeful,
-            panel: None,
+            panels: Vec::new(),
             buttons: Vec::new(),
             seen: HashSet::new(),
             touch_writes,
+            touch_panels,
             w: w as f32,
             h: h as f32,
         };
         inputs.scan()?;
-        if inputs.panel.is_none() {
+        if inputs.panels.is_empty() {
             eprintln!("no touch panel yet; waiting for one to appear under /dev/input");
         }
         Ok(inputs)
     }
 
-    /// Take in the devices under /dev/input not seen before: the first
-    /// direct multitouch device as the panel, and every device with a
-    /// power, volume or back key as buttons. A panel taken in is told what
-    /// the device description writes to the touchscreen.
+    /// Take in the devices under /dev/input not seen before. A single-display
+    /// device keeps the first direct multitouch panel; foldables take each
+    /// touchscreen named by their display mapping.
     fn scan(&mut self) -> Result<()> {
         for (path, dev) in evdev::raw_stream::enumerate() {
             if !self.seen.insert(path.clone()) {
@@ -239,13 +262,19 @@ impl Inputs {
                 .supported_absolute_axes()
                 .is_some_and(|a| a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X) && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y));
             let keys = dev.supported_keys().is_some_and(|k| KEYS.iter().any(|c| k.contains(*c)));
-            eprintln!("input {}: {:?} direct={direct} multitouch={mt} keys={keys}", path.display(), dev.name().unwrap_or("?"));
-            if direct && mt && self.panel.is_none() {
+            let name = dev.name().unwrap_or("?");
+            let target = target_for_device(name, &self.touch_panels);
+            eprintln!("input {}: {name:?} direct={direct} multitouch={mt} keys={keys}", path.display());
+            let take_panel = direct && mt && if self.touch_panels.is_empty() { self.panels.is_empty() } else { target.is_some() };
+            if take_panel {
+                let first = self.panels.is_empty();
                 self.wakeful.add(dev.as_raw_fd())?;
-                self.panel = Some(Panel::new(path, dev)?);
-                for w in &self.touch_writes {
-                    fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
-                    skyward_sys::kmsg(&format!("wrote {} to {} for the touchscreen", w.value, w.path))?;
+                self.panels.push(Panel::new(path, dev, target)?);
+                if first {
+                    for w in &self.touch_writes {
+                        fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
+                        skyward_sys::kmsg(&format!("wrote {} to {} for the touchscreen", w.value, w.path))?;
+                    }
                 }
             } else if keys {
                 set_nonblocking(dev.as_raw_fd()).context("make buttons non-blocking")?;
@@ -277,7 +306,13 @@ impl Inputs {
 
     /// Whether a touch panel has come up.
     pub fn has_panel(&self) -> bool {
-        self.panel.is_some()
+        !self.panels.is_empty()
+    }
+
+    /// The current display size used by unconfigured single-panel devices.
+    pub fn set_size(&mut self, w: u32, h: u32) {
+        self.w = w as f32;
+        self.h = h as f32;
     }
 
     /// Readable while a device has something queued, or /dev/input changed.
@@ -291,16 +326,20 @@ impl Inputs {
             self.scan()?;
         }
         let mut out = Vec::new();
-        if let Some(panel) = &mut self.panel {
+        let mut removed_panels = Vec::new();
+        for (i, panel) in self.panels.iter_mut().enumerate() {
             match panel.read(self.w, self.h, &mut out) {
                 Ok(()) => {}
                 Err(e) if gone(&e) => {
                     eprintln!("input {}: removed", panel.path.display());
-                    self.seen.remove(&panel.path);
-                    self.panel = None;
+                    removed_panels.push(i);
                 }
                 Err(e) => return Err(e).context("read touch events"),
             }
+        }
+        for i in removed_panels.into_iter().rev() {
+            let panel = self.panels.remove(i);
+            self.seen.remove(&panel.path);
         }
         let mut removed = Vec::new();
         for (i, (path, b)) in self.buttons.iter_mut().enumerate() {

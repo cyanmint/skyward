@@ -7,7 +7,8 @@ soc = { hans = "第三代骁龙®8移动平台", hant = "Snapdragon® 8 Gen 3 �
 os_version_prop = "ro.mi.os.version.incremental"
 
 [display]
-# Inner display in portrait orientation; the cover display is not modeled separately.
+# The inner display is the startup target; touch.panel mappings select the
+# matching display mode when a different touchscreen is first used.
 width = 1224
 height = 2912
 # Reported logical density; confirm the UI scale on the phone.
@@ -22,6 +23,18 @@ load = ["goodix_core", "synaptics_tcm2"]
 
 [touch]
 writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
+
+[[touch.panels]]
+device = "synaptics_tcm_touch"
+display_index = 0
+width = 1224
+height = 2912
+
+[[touch.panels]]
+device = "goodix_ts"
+display_index = 1
+width = 1208
+height = 1392
 
 # The stock fstab mounts modem at /vendor/firmware_mnt and persist at
 # /mnt/vendor/persist. The vendor image points the WLAN settings and MAC
