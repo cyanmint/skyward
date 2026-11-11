@@ -1051,7 +1051,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     }
     let mut info = skyward_info::collect(cfg)?;
     let fonts = Fonts::load(font, 0, mono)?;
-    let surface = KmsSurface::open("/dev/dri/card0", 0)?;
+    let display_rotations: Vec<(u32, u16)> = cfg.touch.panels.iter().map(|panel| (panel.display_index, panel.display_rotation)).collect();
+    let surface = KmsSurface::open_with_panels("/dev/dri/card0", 0, &display_rotations)?;
     let (mut w, mut h) = surface.size();
     let mut active_panel = surface.panel_identity();
     eprintln!("display {}", surface.describe());
@@ -1381,7 +1382,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         let now = monotonic_ms();
         if surface.is_none() && reopen_at.is_some_and(|at| Instant::now() >= at) {
             let requested = reopen_display.unwrap_or(0);
-            match KmsSurface::open("/dev/dri/card0", requested) {
+            match KmsSurface::open_with_panels("/dev/dri/card0", requested, &display_rotations) {
                 Ok(restored) => {
                     let identity = restored.panel_identity();
                     let size = restored.size();
@@ -2180,7 +2181,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                                     let Some(current) = surface.take() else {
                                         unreachable!("an active display was observed before taking it")
                                     };
-                                    match current.switch_to(target.display_index) {
+                                    match current.switch_to(target.display_index, &display_rotations) {
                                         Ok((next, switched)) => {
                                             if switched {
                                                 active_panel = next.panel_identity();

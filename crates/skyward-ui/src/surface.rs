@@ -75,6 +75,217 @@ fn reopened_panel_changed(
     previous_identity != active_identity || previous_size != active_size
 }
 
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingHead {
+    Selected(usize),
+}
+
+/// Pick one CRTC and enough primary planes for each head, without sharing
+/// either resource between heads. Candidate and plane order is preference order.
+#[cfg(any(target_os = "android", test))]
+fn plan_head_resources(candidates: &[Vec<(u32, Vec<u32>)>], mixers: &[usize]) -> Option<Vec<(u32, Vec<u32>)>> {
+    fn assign(
+        at: usize,
+        candidates: &[Vec<(u32, Vec<u32>)>],
+        mixers: &[usize],
+        used_crtcs: &mut Vec<u32>,
+        used_planes: &mut Vec<u32>,
+        result: &mut Vec<(u32, Vec<u32>)>,
+    ) -> bool {
+        fn choose_planes(
+            from: usize,
+            available: &[u32],
+            count: usize,
+            chosen: &mut Vec<u32>,
+            visit: &mut impl FnMut(&[u32]) -> bool,
+        ) -> bool {
+            if chosen.len() == count {
+                return visit(chosen);
+            }
+            let needed = count - chosen.len();
+            if available.len().saturating_sub(from) < needed {
+                return false;
+            }
+            for i in from..=available.len() - needed {
+                chosen.push(available[i]);
+                if choose_planes(i + 1, available, count, chosen, visit) {
+                    return true;
+                }
+                chosen.pop();
+            }
+            false
+        }
+
+        if at == candidates.len() {
+            return true;
+        }
+        for (crtc, planes) in &candidates[at] {
+            if used_crtcs.contains(crtc) {
+                continue;
+            }
+            let available: Vec<u32> = planes.iter().copied().filter(|plane| !used_planes.contains(plane)).collect();
+            if available.len() < mixers[at] {
+                continue;
+            }
+            let mut chosen = Vec::new();
+            let mut try_choice = |chosen: &[u32]| {
+                used_crtcs.push(*crtc);
+                used_planes.extend_from_slice(chosen);
+                result.push((*crtc, chosen.to_vec()));
+                if assign(at + 1, candidates, mixers, used_crtcs, used_planes, result) {
+                    return true;
+                }
+                result.pop();
+                used_planes.truncate(used_planes.len() - chosen.len());
+                used_crtcs.pop();
+                false
+            };
+            if choose_planes(0, &available, mixers[at], &mut chosen, &mut try_choice) {
+                return true;
+            }
+        }
+        false
+    }
+
+    if candidates.len() != mixers.len() || mixers.contains(&0) {
+        return None;
+    }
+    let (mut used_crtcs, mut used_planes, mut result) = (Vec::new(), Vec::new(), Vec::new());
+    assign(0, candidates, mixers, &mut used_crtcs, &mut used_planes, &mut result).then_some(result)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn route_head(heads: &[u32], requested_display: u32) -> Option<ExistingHead> {
+    heads.iter().position(|&display| display == requested_display).map(ExistingHead::Selected)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn select_head_index(heads: &[u32], requested_display: u32) -> usize {
+    heads.iter().position(|&display| display == requested_display).unwrap_or(0)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn planes_to_disable(attached: &[(u32, u32)], crtc: u32, used: &[u32]) -> Vec<u32> {
+    attached
+        .iter()
+        .filter_map(|(plane, attached_crtc)| (*attached_crtc == crtc && !used.contains(plane)).then_some(*plane))
+        .collect()
+}
+
+#[cfg(any(target_os = "android", test))]
+fn primary_first_order(displays: &[u32], requested_display: u32) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..displays.len()).collect();
+    order.sort_by_key(|index| displays[*index] != requested_display);
+    order
+}
+
+#[cfg(any(target_os = "android", test))]
+fn open_heads_with_primary_fallback<T>(
+    open_order: &[usize],
+    mut open: impl FnMut(usize) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut heads = Vec::with_capacity(open_order.len());
+    for &index in open_order {
+        match open(index) {
+            Ok(head) => heads.push(head),
+            Err(error) if heads.is_empty() => return Err(error),
+            Err(error) => {
+                eprintln!("could not open an additional display: {error:#}; keeping the requested primary head active");
+                return Ok(heads);
+            }
+        }
+    }
+    Ok(heads)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn with_single_head_fallback<T>(dual: Result<T>, fallback: impl FnOnce(anyhow::Error) -> Result<T>) -> Result<T> {
+    match dual {
+        Ok(value) => Ok(value),
+        Err(error) => fallback(error),
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn other_panel_connectors_to_disable(attached: &[(u32, u32)], selected: u32) -> Vec<u32> {
+    attached
+        .iter()
+        .filter_map(|(connector, _)| (*connector != selected).then_some(*connector))
+        .collect()
+}
+
+#[cfg(any(target_os = "android", test))]
+fn connectors_to_disable(attached: &[(u32, u32)], selected: u32, crtc: u32) -> Vec<u32> {
+    attached
+        .iter()
+        .filter_map(|(connector, attached_crtc)| (*attached_crtc == crtc && *connector != selected).then_some(*connector))
+        .collect()
+}
+
+#[cfg(any(target_os = "android", test))]
+fn crtcs_to_disable(assignments: &[(u32, u32)], changed_connectors: &[u32], target_crtc: u32) -> Vec<u32> {
+    let mut disabled = Vec::new();
+    for &(connector, crtc) in assignments {
+        if crtc == 0 || crtc == target_crtc || !changed_connectors.contains(&connector) || disabled.contains(&crtc) {
+            continue;
+        }
+        if assignments
+            .iter()
+            .filter(|(_, assigned_crtc)| *assigned_crtc == crtc)
+            .all(|(id, _)| changed_connectors.contains(id))
+        {
+            disabled.push(crtc);
+        }
+    }
+    disabled
+}
+
+/// Keep both scanouts and touch controllers live in multi-head mode. Until
+/// wake-on-touch from suspend is verified on-device, do not suspend while
+/// either panel must remain touchable.
+#[cfg(any(target_os = "android", test))]
+fn can_power_down_heads(head_count: usize) -> bool {
+    head_count <= 1
+}
+
+#[cfg(any(target_os = "android", test))]
+fn rotation_for_display(display_index: u32, panels: &[(u32, u16)]) -> u16 {
+    panels
+        .iter()
+        .find_map(|(index, rotation)| (*index == display_index).then_some(*rotation))
+        .unwrap_or(0)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn scanout_source_pixel(x: u32, y: u32, width: u32, height: u32, rotation: u16) -> (u32, u32) {
+    if rotation == 180 {
+        (width - 1 - x, height - 1 - y)
+    } else {
+        (x, y)
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn copy_scanout_frame(source: &[u8], destination: &mut [u8], width: u32, height: u32, pitch: usize, rotate_180: bool, swap_red_blue: bool) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let row = width as usize * 4;
+    for y in 0..height as usize {
+        let source_y = if rotate_180 { height as usize - 1 - y } else { y };
+        let source_row = &source[source_y * row..(source_y + 1) * row];
+        let destination_row = &mut destination[y * pitch..y * pitch + row];
+        let source_pixels = source_row.as_chunks::<4>().0;
+        let destination_pixels = destination_row.as_chunks_mut::<4>().0;
+        for (x, output) in destination_pixels.iter_mut().enumerate() {
+            let source_x = if rotate_180 { width as usize - 1 - x } else { x };
+            let pixel = source_pixels[source_x];
+            *output = if swap_red_blue { [pixel[2], pixel[1], pixel[0], pixel[3]] } else { pixel };
+        }
+    }
+}
+
 /// How Qualcomm's display driver drives a mode, from the text of the
 /// connector's mode_properties blob: key=value lines, a block per mode_name.
 #[cfg(any(target_os = "android", test))]
@@ -260,11 +471,150 @@ mod tests {
     }
 
     #[test]
+    fn outer_display_rotation_flips_scanout_pixels_without_swapping_axes() {
+        let (w, h) = (1208, 1392);
+        assert_eq!(scanout_source_pixel(0, 0, w, h, 180), (w - 1, h - 1));
+        assert_eq!(scanout_source_pixel(w - 1, h - 1, w, h, 180), (0, 0));
+        assert_eq!(scanout_source_pixel(w - 1, 0, w, h, 180), (0, h - 1));
+        assert_eq!(scanout_source_pixel(0, h - 1, w, h, 180), (w - 1, 0));
+        assert_eq!(scanout_source_pixel(0, 0, w, h, 0), (0, 0));
+    }
+
+    #[test]
+    fn scanout_copy_rotates_real_pixels_and_preserves_row_padding() {
+        let source = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let mut destination = [0xaa; 24];
+        copy_scanout_frame(&source, &mut destination, 2, 2, 12, true, true);
+        assert_eq!(&destination[0..8], &[15, 14, 13, 16, 11, 10, 9, 12]);
+        assert_eq!(&destination[8..12], &[0xaa; 4]);
+        assert_eq!(&destination[12..20], &[7, 6, 5, 8, 3, 2, 1, 4]);
+        assert_eq!(&destination[20..24], &[0xaa; 4]);
+    }
+
+    #[test]
+    fn display_rotation_is_selected_by_logical_panel_not_touch_rotation() {
+        let panels = [(0, 0), (1, 180)];
+        assert_eq!(rotation_for_display(0, &panels), 0);
+        assert_eq!(rotation_for_display(1, &panels), 180);
+        assert_eq!(rotation_for_display(2, &panels), 0);
+    }
+
+    #[test]
     fn selects_the_requested_dsi_connector_and_falls_back_to_connected_panel() {
         assert_eq!(select_dsi_connector(&[2, 1], 1), Some(2));
         assert_eq!(select_dsi_connector(&[2, 1], 0), Some(1));
         assert_eq!(select_dsi_connector(&[1], 1), Some(1));
         assert_eq!(select_dsi_connector(&[], 0), None);
+    }
+
+    #[test]
+    fn allocates_distinct_crtcs_and_disjoint_planes_for_each_mixer() {
+        let candidates = [
+            vec![(211, vec![103, 134]), (275, vec![138, 142, 146])],
+            vec![(211, vec![103, 134]), (275, vec![138, 142, 146]), (284, vec![150])],
+        ];
+        let allocation = plan_head_resources(&candidates, &[2, 1]).unwrap();
+        assert_eq!(allocation, vec![(211, vec![103, 134]), (275, vec![138])]);
+        assert_ne!(allocation[0].0, allocation[1].0);
+        assert!(allocation[0].1.iter().all(|plane| !allocation[1].1.contains(plane)));
+    }
+
+    #[test]
+    fn allocator_backtracks_over_plane_choices_to_keep_resources_disjoint() {
+        let candidates = [
+            vec![(211, vec![103, 134, 138])],
+            vec![(275, vec![103])],
+        ];
+        let allocation = plan_head_resources(&candidates, &[2, 1]).unwrap();
+        assert_eq!(allocation, vec![(211, vec![134, 138]), (275, vec![103])]);
+    }
+
+    #[test]
+    fn head_allocation_fails_when_crtcs_or_mixer_planes_are_insufficient() {
+        let same_crtc = [vec![(211, vec![103, 134])], vec![(211, vec![138, 142])]];
+        assert!(plan_head_resources(&same_crtc, &[2, 2]).is_none());
+
+        let too_few_planes = [vec![(211, vec![103])]];
+        assert!(plan_head_resources(&too_few_planes, &[2]).is_none());
+    }
+
+    #[test]
+    fn touch_routing_selects_an_open_head_and_preserves_the_other_head() {
+        let open_heads = [0, 1];
+        assert_eq!(route_head(&open_heads, 0), Some(ExistingHead::Selected(0)));
+        assert_eq!(route_head(&open_heads, 1), Some(ExistingHead::Selected(1)));
+        assert_eq!(route_head(&open_heads, 2), None);
+        assert_eq!(open_heads, [0, 1]);
+    }
+
+    #[test]
+    fn requested_head_remains_selected_after_all_heads_are_initialized() {
+        let initialized_heads = [1, 0];
+        assert_eq!(select_head_index(&initialized_heads, 0), 1);
+        assert_eq!(select_head_index(&initialized_heads, 1), 0);
+        assert_eq!(select_head_index(&initialized_heads, 2), 0);
+    }
+
+    #[test]
+    fn stale_planes_are_cleared_only_from_the_crtc_being_reconfigured() {
+        let attached = [(103, 211), (134, 211), (138, 275), (150, 211)];
+        assert_eq!(planes_to_disable(&attached, 211, &[103]), [134, 150]);
+    }
+
+    #[test]
+    fn single_head_fallback_detaches_other_panel_connectors() {
+        let attached = [(14, 211), (15, 211), (16, 275), (17, 293)];
+        assert_eq!(other_panel_connectors_to_disable(&attached, 14), [15, 16, 17]);
+        assert_eq!(connectors_to_disable(&attached, 14, 211), [15]);
+    }
+
+    #[test]
+    fn only_disable_crtcs_without_a_surviving_connector() {
+        let assignments = [(14, 211), (15, 275), (16, 275), (17, 293)];
+        assert_eq!(crtcs_to_disable(&assignments, &[15], 211), Vec::<u32>::new());
+        assert_eq!(crtcs_to_disable(&assignments, &[15, 16], 211), [275]);
+    }
+
+    #[test]
+    fn requested_primary_is_opened_before_secondary() {
+        assert_eq!(primary_first_order(&[0, 1], 1), [1, 0]);
+        assert_eq!(primary_first_order(&[0, 1], 9), [0, 1]);
+    }
+
+    #[test]
+    fn secondary_open_failure_keeps_requested_primary_as_single_head() {
+        let open_order = [1, 0];
+        let mut fallback_called = false;
+        let opened = open_heads_with_primary_fallback(&open_order, |index| {
+            if index == 1 {
+                Ok("requested primary")
+            } else {
+                Err(anyhow::anyhow!("secondary head failed"))
+            }
+        });
+        let result = with_single_head_fallback(opened, |_| {
+            fallback_called = true;
+            Ok(vec!["single fallback"])
+        });
+        assert_eq!(result.unwrap(), ["requested primary"]);
+        assert!(!fallback_called);
+    }
+
+    #[test]
+    fn primary_open_failure_uses_the_single_head_fallback() {
+        let open_order = [1, 0];
+        let opened = open_heads_with_primary_fallback(&open_order, |_| Err(anyhow::anyhow!("primary head failed")));
+        let result = with_single_head_fallback(opened, |error| {
+            assert!(error.to_string().contains("primary head failed"));
+            Ok(vec!["fallback head"])
+        });
+        assert_eq!(result.unwrap(), ["fallback head"]);
+    }
+
+    #[test]
+    fn multi_head_mode_keeps_touch_heads_out_of_idle_powerdown() {
+        assert!(can_power_down_heads(1));
+        assert!(!can_power_down_heads(2));
     }
 
     #[test]
@@ -392,6 +742,12 @@ pub mod kms {
         len: usize,
     }
 
+    impl Drop for Buf {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.map.cast(), self.len) };
+        }
+    }
+
     /// A KMS object's properties by name, with their current values.
     struct Props(HashMap<String, (property::Handle, u64)>);
 
@@ -449,12 +805,10 @@ pub mod kms {
         matches!(interface, connector::Interface::DSI | connector::Interface::EmbeddedDisplayPort | connector::Interface::LVDS)
     }
 
-    /// Commit without blocking and wait for the flip event, so a commit the
-    /// display never completes surfaces as an error instead of an endless
-    /// wait.
+    /// Apply a modeset synchronously. A successful return means the state
+    /// change completed; no page-flip event is awaited for CRTC modesets.
     fn commit(card: &Card, req: atomic::AtomicModeReq, flags: AtomicCommitFlags) -> Result<()> {
-        card.atomic_commit(flags | AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT, req).context("atomic commit")?;
-        flipped(card)
+        card.atomic_commit(flags, req).context("atomic modeset")
     }
 
     /// Wait for the flip event of the commit made last, or fail once the
@@ -475,10 +829,14 @@ pub mod kms {
             if n == 0 {
                 return Err(anyhow!("the display did not complete the commit within {} ms", COMMIT_TIMEOUT.as_millis()));
             }
+            let mut saw_flip = false;
             for event in card.receive_events().context("read display events")? {
                 if let Event::PageFlip(_) = event {
-                    return Ok(());
+                    saw_flip = true;
                 }
+            }
+            if saw_flip {
+                return Ok(());
             }
         }
     }
@@ -586,9 +944,9 @@ pub mod kms {
         Ok(c)
     }
 
-    /// Direct scanout on the built-in panel: its fastest mode on the CRTC
-    /// driving it, three dumb buffers taken in turn on its primary planes,
-    /// and every other connector and plane taken off that CRTC.
+    /// Direct scanout on a built-in panel: its fastest mode on an allocated
+    /// CRTC, three dumb buffers presented by its primary planes, without
+    /// disturbing other heads on the DRM card.
     /// How the display stands.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Power {
@@ -599,11 +957,80 @@ pub mod kms {
         Off,
     }
 
-    pub struct KmsSurface {
-        card: Card,
-        path: String,
+    fn head_resource_choices(
+        card: &Card,
+        resources: &drm::control::ResourceHandles,
+        conn: &connector::Info,
+    ) -> Result<(usize, Vec<(u32, Vec<u32>)>)> {
+        let preferred = conn
+            .modes()
+            .iter()
+            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .ok_or_else(|| anyhow!("the panel reports no preferred mode"))?;
+        let mode = conn
+            .modes()
+            .iter()
+            .filter(|m| m.size() == preferred.size())
+            .max_by_key(|m| m.vrefresh())
+            .unwrap_or(preferred);
+        let props = Props::read(card, conn.handle())?;
+        let layout = match props.get("mode_properties") {
+            Ok((_, blob)) => SdeMode::find(&String::from_utf8_lossy(&card.get_property_blob(blob)?), &mode.name().to_string_lossy())?,
+            Err(_) => SdeMode { mixers: 1, dsc: false },
+        };
+        let mixers = layout.mixers as usize;
+
+        let mut crtcs = Vec::new();
+        if let Some(encoder) = conn.current_encoder() {
+            if let Some(crtc) = card.get_encoder(encoder).context("read current panel encoder")?.crtc() {
+                crtcs.push(crtc);
+            }
+        }
+        for &encoder in conn.encoders() {
+            for crtc in resources.filter_crtcs(card.get_encoder(encoder).context("read panel encoder")?.possible_crtcs()) {
+                if !crtcs.contains(&crtc) {
+                    crtcs.push(crtc);
+                }
+            }
+        }
+        let mut choices = Vec::new();
+        for crtc in crtcs {
+            let mut planes = Vec::new();
+            for plane in card.plane_handles().context("list planes")? {
+                let info = card.get_plane(plane).context("read plane")?;
+                if props_type_primary(card, plane)?
+                    && resources.filter_crtcs(info.possible_crtcs()).contains(&crtc)
+                    && info.crtc().is_none_or(|attached| attached == crtc)
+                {
+                    planes.push((plane, info.formats().to_vec(), info.crtc() == Some(crtc)));
+                }
+            }
+            planes.sort_by_key(|(_, _, attached)| !attached);
+            let formats = [DrmFourcc::Xbgr8888, DrmFourcc::Abgr8888, DrmFourcc::Xrgb8888, DrmFourcc::Argb8888];
+            let Some(format) = formats
+                .iter()
+                .find(|format| planes.iter().filter(|(_, fs, _)| fs.contains(&(**format as u32))).count() >= mixers)
+            else {
+                continue;
+            };
+            let ids: Vec<u32> = planes
+                .iter()
+                .filter(|(_, fs, _)| fs.contains(&(*format as u32)))
+                .map(|(handle, _, _)| u32::from(*handle))
+                .collect();
+            choices.push((u32::from(crtc), ids));
+        }
+        Ok((mixers, choices))
+    }
+
+    fn props_type_primary(card: &Card, plane: plane::Handle) -> Result<bool> {
+        Ok(Props::read(card, plane)?.value("type")? == PlaneType::Primary as u64)
+    }
+
+    pub struct KmsHead {
         display_index: u32,
         panel_identity: PanelIdentity,
+        display_rotation: u16,
         bufs: [Buf; 3],
         /// The buffer the next frame goes into.
         back: usize,
@@ -617,21 +1044,12 @@ pub mod kms {
         crtc: drm::control::crtc::Handle,
         active: property::Handle,
         mode_id: property::Handle,
-        /// The panel's preferred mode, which it comes up in, and its
-        /// fastest, which it switches to after, where that is another.
         preferred: property::Value<'static>,
         fastest: Option<property::Value<'static>>,
-        /// The sub-pixel rendering setup the CRTC takes with each mode,
-        /// where the panel leaves its sub-pixel rendering to the display.
         spr: Option<(property::Handle, property::Value<'static>)>,
-        /// The panel's connector, with its low-power switch where the
-        /// display driver has one, and the switch's values for running and
-        /// for resting.
         conn: connector::Handle,
         lp: Option<(property::Handle, u64, u64)>,
         power: Power,
-        /// The display came on again in the panel's preferred mode, and the
-        /// panel has yet to switch to its fastest.
         slow: bool,
         w: u32,
         h: u32,
@@ -639,36 +1057,168 @@ pub mod kms {
         summary: String,
     }
 
+    pub struct KmsSurface {
+        card: std::sync::Arc<Card>,
+        path: String,
+        heads: Vec<KmsHead>,
+        selected: usize,
+    }
+
+    impl std::ops::Deref for KmsSurface {
+        type Target = KmsHead;
+
+        fn deref(&self) -> &Self::Target {
+            &self.heads[self.selected]
+        }
+    }
+
+    impl std::ops::DerefMut for KmsSurface {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.heads[self.selected]
+        }
+    }
+
     impl KmsSurface {
         pub fn open(path: &str, requested_display: u32) -> Result<Self> {
-            let card = open_card(path)?;
-            let res = card.resource_handles().context("read KMS resources")?;
+            Self::open_with_panels(path, requested_display, &[])
+        }
 
-            let mut dsi_panels = Vec::new();
-            let mut other_panels = Vec::new();
-            for &h in res.connectors() {
-                let info = card.get_connector(h, true).context("read connector")?;
-                if is_panel(info.interface()) && info.state() == connector::State::Connected {
-                    if info.interface() == connector::Interface::DSI {
-                        dsi_panels.push(info.clone());
-                    }
-                    other_panels.push(info);
+        /// Open on a configured display, applying its scanout orientation.
+        pub fn open_with_panels(path: &str, requested_display: u32, panel_rotations: &[(u32, u16)]) -> Result<Self> {
+            let card = std::sync::Arc::new(open_card(path)?);
+            let displays: Vec<u32> = panel_rotations.iter().map(|(display, _)| *display).collect();
+            let heads = if displays.len() > 1 {
+                let dual = Self::open_dual_heads(&card, &displays, panel_rotations, requested_display);
+                super::with_single_head_fallback(dual, |error| {
+                    eprintln!("could not open all configured displays: {error:#}; falling back to one display");
+                    Self::open_head(std::sync::Arc::clone(&card), requested_display, panel_rotations, None).map(|head| vec![head])
+                })?
+            } else {
+                vec![Self::open_head(std::sync::Arc::clone(&card), requested_display, panel_rotations, None)?]
+            };
+            let display_indices: Vec<u32> = heads.iter().map(|head| head.display_index).collect();
+            let mut surface = Self { card, path: path.to_owned(), heads, selected: 0 };
+            for selected in 0..surface.heads.len() {
+                surface.selected = selected;
+                if let Err(error) = surface.to_fastest() {
+                    eprintln!("could not switch display {} to its fastest refresh: {error:#}; keeping its preferred mode", surface.display_index);
+                    surface.slow = true;
                 }
             }
-            dsi_panels.sort_by_key(|info| info.interface_id());
-            other_panels.sort_by_key(|info| (info.interface() as u32, info.interface_id()));
-            let connected_ids: Vec<u32> = dsi_panels.iter().map(|info| info.interface_id()).collect();
-            let selected_id = super::select_dsi_connector(&connected_ids, requested_display);
-            let conn = selected_id
-                .and_then(|id| dsi_panels.iter().find(|info| info.interface_id() == id).cloned())
-                .or_else(|| other_panels.first().cloned())
+            surface.selected = super::select_head_index(&display_indices, requested_display);
+            Ok(surface)
+        }
+
+        fn open_dual_heads(
+            card: &std::sync::Arc<Card>,
+            displays: &[u32],
+            panel_rotations: &[(u32, u16)],
+            requested_display: u32,
+        ) -> Result<Vec<KmsHead>> {
+            let resources = card.resource_handles().context("read KMS resources")?;
+            let mut connectors = Vec::new();
+            for display in displays {
+                let interface_id = display.checked_add(1).ok_or_else(|| anyhow!("display index overflow"))?;
+                let mut found = None;
+                for &handle in resources.connectors() {
+                    let info = card.get_connector(handle, true).context("read configured panel connector")?;
+                    if info.interface() == connector::Interface::DSI
+                        && info.interface_id() == interface_id
+                        && info.state() == connector::State::Connected
+                    {
+                        found = Some(info);
+                        break;
+                    }
+                }
+                let connector = found.ok_or_else(|| anyhow!("configured display {display} is not connected"))?;
+                connectors.push(connector);
+            }
+            let mut planning = Vec::new();
+            for (index, connector) in connectors.iter().enumerate() {
+                let active = match connector.current_encoder() {
+                    Some(encoder) => card.get_encoder(encoder).context("read current panel encoder")?.crtc().is_some(),
+                    None => false,
+                };
+                let (mixers, choices) = head_resource_choices(card, &resources, connector)?;
+                planning.push((!active, index, mixers, choices));
+            }
+            // Keep a currently lit connector's CRTC and planes with it;
+            // otherwise an earlier configured-but-disabled panel could take
+            // the live head's resources before it is reattached.
+            planning.sort_by_key(|(inactive, index, _, _)| (*inactive, *index));
+            let candidates: Vec<_> = planning.iter().map(|(_, _, _, choices)| choices.clone()).collect();
+            let mixer_counts: Vec<_> = planning.iter().map(|(_, _, mixers, _)| *mixers).collect();
+            let allocation = super::plan_head_resources(&candidates, &mixer_counts)
+                .ok_or_else(|| anyhow!("connected panels cannot be assigned distinct CRTCs and primary planes"))?;
+            let mut per_connector = vec![None; connectors.len()];
+            for (i, (_, connector_index, _, _)) in planning.iter().enumerate() {
+                per_connector[*connector_index] = Some(allocation[i].clone());
+            }
+            let open_order = super::primary_first_order(displays, requested_display);
+            let primary = open_order[0];
+            super::open_heads_with_primary_fallback(&open_order, |index| {
+                Self::open_configured_head(
+                    std::sync::Arc::clone(card),
+                    &connectors[index],
+                    panel_rotations,
+                    Some(per_connector[index].take().unwrap()),
+                    index == primary,
+                )
+            })
+        }
+
+        fn open_configured_head(
+            card: std::sync::Arc<Card>,
+            connector: &connector::Info,
+            panel_rotations: &[(u32, u16)],
+            allocation: Option<(u32, Vec<u32>)>,
+            disable_other_panels: bool,
+        ) -> Result<KmsHead> {
+            let resources = card.resource_handles().context("read KMS resources")?;
+            let panel_identity = (connector.interface() as u32, connector.interface_id());
+            let display_index = connector.interface_id().saturating_sub(1);
+            Self::open_head_info(
+                card, resources, connector.clone(), panel_identity, display_index, panel_rotations, allocation, disable_other_panels,
+            )
+        }
+
+        fn open_head(
+            card: std::sync::Arc<Card>,
+            requested_display: u32,
+            panel_rotations: &[(u32, u16)],
+            allocation: Option<(u32, Vec<u32>)>,
+        ) -> Result<KmsHead> {
+            let resources = card.resource_handles().context("read KMS resources")?;
+            let mut panels = Vec::new();
+            for &handle in resources.connectors() {
+                let info = card.get_connector(handle, true).context("read connector")?;
+                if is_panel(info.interface()) && info.state() == connector::State::Connected {
+                    panels.push(info);
+                }
+            }
+            panels.sort_by_key(|info| (info.interface() as u32, info.interface_id()));
+            let chosen = panels
+                .iter()
+                .find(|info| info.interface() == connector::Interface::DSI && super::is_requested_dsi((info.interface() as u32, info.interface_id()), requested_display, connector::Interface::DSI as u32))
+                .or_else(|| panels.first())
+                .cloned()
                 .ok_or_else(|| anyhow!("no connected built-in panel"))?;
-            let panel_identity = (conn.interface() as u32, conn.interface_id());
-            let display_index = if conn.interface() == connector::Interface::DSI {
-                conn.interface_id().saturating_sub(1)
-            } else {
-                0
-            };
+            let panel_identity = (chosen.interface() as u32, chosen.interface_id());
+            let display_index = if chosen.interface() == connector::Interface::DSI { chosen.interface_id().saturating_sub(1) } else { 0 };
+            Self::open_head_info(card, resources, chosen, panel_identity, display_index, panel_rotations, allocation, true)
+        }
+
+        fn open_head_info(
+            card: std::sync::Arc<Card>,
+            res: drm::control::ResourceHandles,
+            conn: connector::Info,
+            panel_identity: PanelIdentity,
+            display_index: u32,
+            panel_rotations: &[(u32, u16)],
+            allocation: Option<(u32, Vec<u32>)>,
+            disable_other_panels: bool,
+        ) -> Result<KmsHead> {
+            let display_rotation = super::rotation_for_display(display_index, panel_rotations);
             let preferred = conn
                 .modes()
                 .iter()
@@ -692,18 +1242,26 @@ pub mod kms {
                 Some(e) => card.get_encoder(e).context("read encoder")?.crtc(),
                 None => None,
             };
-            let crtc = match current {
-                Some(c) => c,
-                None => {
-                    let mut found = None;
-                    for &e in conn.encoders() {
-                        let enc = card.get_encoder(e).context("read encoder")?;
-                        if let Some(&c) = res.filter_crtcs(enc.possible_crtcs()).first() {
-                            found = Some(c);
-                            break;
+            let crtc = if let Some((id, _)) = &allocation {
+                res.crtcs()
+                    .iter()
+                    .copied()
+                    .find(|crtc| u32::from(*crtc) == *id)
+                    .ok_or_else(|| anyhow!("allocated CRTC {id} disappeared"))?
+            } else {
+                match current {
+                    Some(c) => c,
+                    None => {
+                        let mut found = None;
+                        for &e in conn.encoders() {
+                            let enc = card.get_encoder(e).context("read encoder")?;
+                            if let Some(&c) = res.filter_crtcs(enc.possible_crtcs()).first() {
+                                found = Some(c);
+                                break;
+                            }
                         }
+                        found.ok_or_else(|| anyhow!("no CRTC can drive the panel"))?
                     }
-                    found.ok_or_else(|| anyhow!("no CRTC can drive the panel"))?
                 }
             };
 
@@ -716,6 +1274,7 @@ pub mod kms {
             // mixers, no DSC selection and the default trigger, the 13
             // Ultra's panel tore while scrolling.
             let conn_props = Props::read(&card, conn.handle())?;
+            let connector_crtc = conn_props.handle("CRTC_ID")?;
             let layout = match conn_props.get("mode_properties") {
                 Ok((_, blob)) => {
                     let text = card.get_property_blob(blob).context("read mode_properties")?;
@@ -728,9 +1287,10 @@ pub mod kms {
                 return Err(anyhow!("{w} pixels do not split into {strips} strips"));
             }
 
-            // Primary planes that can drive the CRTC, those already on it
-            // first so the boot splash's planes are reused; planes on the
-            // CRTC that are not used are switched off.
+            // Primary planes must be usable without disabling another CRTC.
+            // Multi-head opens pass a globally disjoint allocation from the
+            // planner; single-head opens keep the existing preferred order.
+            let assigned = allocation.as_ref().map(|(_, ids)| ids);
             let mut candidates: Vec<(plane::Handle, Vec<u32>, Props, bool)> = Vec::new();
             let mut attached = Vec::new();
             for p in card.plane_handles().context("list planes")? {
@@ -740,7 +1300,12 @@ pub mod kms {
                 if on_crtc {
                     attached.push(p);
                 }
-                if props.value("type")? == PlaneType::Primary as u64 && res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
+                let available = info.crtc().is_none_or(|attached| attached == crtc);
+                if props.value("type")? == PlaneType::Primary as u64
+                    && res.filter_crtcs(info.possible_crtcs()).contains(&crtc)
+                    && available
+                    && assigned.is_none_or(|ids| ids.contains(&u32::from(p)))
+                {
                     candidates.push((p, info.formats().to_vec(), props, on_crtc));
                 }
             }
@@ -748,7 +1313,9 @@ pub mod kms {
             if candidates.len() < strips {
                 return Err(anyhow!("{strips} primary planes needed, {} can drive the CRTC", candidates.len()));
             }
-            candidates.truncate(strips);
+            if assigned.is_none() {
+                candidates.truncate(strips);
+            }
 
             let pick = [
                 (DrmFourcc::Xbgr8888, Order::Rgba),
@@ -775,18 +1342,85 @@ pub mod kms {
             };
             let bufs = [make()?, make()?, make()?];
 
-            let crtc_id = u64::from(u32::from(crtc));
-            let mut req = atomic::AtomicModeReq::new();
-            for &other in res.connectors().iter().filter(|&&c| c != conn.handle()) {
-                let props = Props::read(&card, other)?;
-                if props.value("CRTC_ID")? == crtc_id {
-                    req.add_property(other, props.handle("CRTC_ID")?, property::Value::CRTC(None));
+            let selected_connector = u32::from(conn.handle());
+            let selected_old_crtc = u32::try_from(conn_props.value("CRTC_ID")?).context("read selected connector CRTC ID")?;
+            let mut panel_assignments = Vec::new();
+            let mut all_connector_assignments = vec![(selected_connector, selected_old_crtc)];
+            let mut connector_crtc_props = Vec::new();
+            for &handle in res.connectors() {
+                if handle == conn.handle() {
+                    continue;
                 }
+                let other = card.get_connector(handle, false).context("read connector")?;
+                let panel = is_panel(other.interface());
+                let props = Props::read(&card, handle)?;
+                let Ok((crtc_property, value)) = props.get("CRTC_ID") else {
+                    if panel {
+                        return Err(anyhow!("panel connector {} has no CRTC_ID property", u32::from(handle)));
+                    }
+                    continue;
+                };
+                let attached_crtc = u32::try_from(value).context("read connector CRTC ID")?;
+                let connector_id = u32::from(handle);
+                all_connector_assignments.push((connector_id, attached_crtc));
+                if panel {
+                    panel_assignments.push((connector_id, attached_crtc));
+                    connector_crtc_props.push((handle, crtc_property));
+                }
+            }
+            let connectors_to_detach = if disable_other_panels {
+                super::other_panel_connectors_to_disable(&panel_assignments, selected_connector)
+            } else {
+                super::connectors_to_disable(&panel_assignments, selected_connector, u32::from(crtc))
+            };
+            let mut changed_connectors = connectors_to_detach.clone();
+            if selected_old_crtc != u32::from(crtc) {
+                changed_connectors.push(selected_connector);
+            }
+            let crtcs_to_disable = super::crtcs_to_disable(
+                &all_connector_assignments,
+                &changed_connectors,
+                u32::from(crtc),
+            );
+
+            let mut req = atomic::AtomicModeReq::new();
+            for old_crtc_id in crtcs_to_disable {
+                let old_crtc = res
+                    .crtcs()
+                    .iter()
+                    .copied()
+                    .find(|candidate| u32::from(*candidate) == old_crtc_id)
+                    .ok_or_else(|| anyhow!("connector references missing CRTC {old_crtc_id}"))?;
+                let old_props = Props::read(&card, old_crtc)?;
+                req.add_property(old_crtc, old_props.handle("ACTIVE")?, property::Value::Boolean(false));
+                for plane in card.plane_handles().context("list planes")? {
+                    if card.get_plane(plane).context("read plane")?.crtc() != Some(old_crtc) {
+                        continue;
+                    }
+                    let props = Props::read(&card, plane)?;
+                    req.add_property(plane, props.handle("FB_ID")?, property::Value::Framebuffer(None));
+                    req.add_property(plane, props.handle("CRTC_ID")?, property::Value::CRTC(None));
+                }
+            }
+            let attached_ids: Vec<(u32, u32)> = attached.iter().map(|plane| (u32::from(*plane), u32::from(crtc))).collect();
+            let used_ids: Vec<u32> = candidates.iter().map(|(plane, _, _, _)| u32::from(*plane)).collect();
+            for plane_id in super::planes_to_disable(&attached_ids, u32::from(crtc), &used_ids) {
+                let plane = attached.iter().find(|plane| u32::from(**plane) == plane_id).expect("attached plane id came from its handle");
+                let props = Props::read(&card, *plane)?;
+                req.add_property(*plane, props.handle("FB_ID")?, property::Value::Framebuffer(None));
+                req.add_property(*plane, props.handle("CRTC_ID")?, property::Value::CRTC(None));
             }
             let crtc_props = Props::read(&card, crtc)?;
             let blob = card.create_property_blob(&mode).context("create mode blob")?;
             let first = card.create_property_blob(preferred).context("create mode blob")?;
-            req.add_property(conn.handle(), conn_props.handle("CRTC_ID")?, property::Value::CRTC(Some(crtc)));
+            for connector_id in connectors_to_detach {
+                let (connector, property) = connector_crtc_props
+                    .iter()
+                    .find(|(connector, _)| u32::from(*connector) == connector_id)
+                    .expect("attached connector property came from its handle");
+                req.add_property(*connector, *property, property::Value::CRTC(None));
+            }
+            req.add_property(conn.handle(), connector_crtc, property::Value::CRTC(Some(crtc)));
             // The mode is DSC-compressed: select its DSC variant, as Android's
             // compositor does.
             if layout.dsc {
@@ -825,18 +1459,14 @@ pub mod kms {
             if let Some((id, setup, _)) = spr {
                 req.add_property(crtc, id, setup);
             }
-            for &other in attached.iter().filter(|&&p| !candidates.iter().any(|c| c.0 == p)) {
-                let props = Props::read(&card, other)?;
-                req.add_property(other, props.handle("FB_ID")?, property::Value::Framebuffer(None));
-                req.add_property(other, props.handle("CRTC_ID")?, property::Value::CRTC(None));
-            }
             let strip = w / layout.mixers;
             let mut planes = Vec::new();
             for (i, (plane, _, props, _)) in candidates.iter().enumerate() {
                 let x = strip * i as u32;
                 let fb_prop = props.handle("FB_ID")?;
+                let plane_crtc = props.handle("CRTC_ID")?;
                 req.add_property(*plane, fb_prop, property::Value::Framebuffer(Some(bufs[0].fb)));
-                req.add_property(*plane, props.handle("CRTC_ID")?, property::Value::CRTC(Some(crtc)));
+                req.add_property(*plane, plane_crtc, property::Value::CRTC(Some(crtc)));
                 req.add_property(*plane, props.handle("SRC_X")?, property::Value::UnsignedRange((x as u64) << 16));
                 req.add_property(*plane, props.handle("SRC_Y")?, property::Value::UnsignedRange(0));
                 req.add_property(*plane, props.handle("SRC_W")?, property::Value::UnsignedRange((strip as u64) << 16));
@@ -847,6 +1477,10 @@ pub mod kms {
                 req.add_property(*plane, props.handle("CRTC_H")?, property::Value::UnsignedRange(h as u64));
                 planes.push((*plane, fb_prop));
             }
+            let lp = match conn_props.get("LP") {
+                Ok((id, _)) => Some((id, enum_value(&card, id, "ON")?, enum_value(&card, id, "LP2")?)),
+                Err(_) => None,
+            };
             // The panel comes up in its preferred mode, then switches to the
             // fastest, as `to_fastest` says why.
             commit(&card, req, AtomicCommitFlags::ALLOW_MODESET).context("set the panel mode")?;
@@ -854,7 +1488,7 @@ pub mod kms {
 
             let ids: Vec<u32> = planes.iter().map(|p| u32::from(p.0)).collect();
             let summary = format!(
-                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}{}",
+                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}, rotation {display_rotation}{}",
                 conn.interface(),
                 u32::from(conn.handle()),
                 mode.name(),
@@ -864,16 +1498,11 @@ pub mod kms {
                 spr.as_ref().map(|(_, _, name)| format!(", sub-pixel rendering through {name}")).unwrap_or_default()
             );
             let spr = spr.map(|(id, setup, _)| (id, setup));
-            let lp = match conn_props.get("LP") {
-                Ok((id, _)) => Some((id, enum_value(&card, id, "ON")?, enum_value(&card, id, "LP2")?)),
-                Err(_) => None,
-            };
             let conn = conn.handle();
-            let s = KmsSurface {
-                card,
-                path: path.to_owned(),
+            Ok(KmsHead {
                 display_index,
                 panel_identity,
+                display_rotation,
                 bufs,
                 back: 1,
                 flipping: false,
@@ -892,9 +1521,17 @@ pub mod kms {
                 h,
                 order,
                 summary,
-            };
-            s.to_fastest()?;
-            Ok(s)
+            })
+        }
+
+        fn settle_all(&mut self) -> Result<()> {
+            if self.heads.iter().any(|head| head.flipping) {
+                flipped(&self.card).context("flip")?;
+                for head in &mut self.heads {
+                    head.flipping = false;
+                }
+            }
+            Ok(())
         }
 
         pub fn display_index(&self) -> u32 {
@@ -913,11 +1550,29 @@ pub mod kms {
             )
         }
 
-        /// Reopen KMS on another built-in panel. The current surface is shut
-        /// down first so its DRM master is released before the new modeset.
-        /// An unavailable target or a failed shutdown keeps the current surface;
-        /// a failed modeset lets the caller retry without blocking its event loop.
-        pub fn switch_to(mut self, requested_display: u32) -> Result<(Self, bool)> {
+        /// Select an already-open head when possible; single-head surfaces can
+        /// still reopen on another built-in panel. Unknown routes keep the
+        /// current surface so other configured touch panels remain active.
+        pub fn switch_to(mut self, requested_display: u32, panel_rotations: &[(u32, u16)]) -> Result<(Self, bool)> {
+            let head_displays: Vec<u32> = self.heads.iter().map(|head| head.display_index).collect();
+            if let Some(super::ExistingHead::Selected(index)) = super::route_head(&head_displays, requested_display) {
+                let changed = self.panel_identity != self.heads[index].panel_identity || self.size() != (self.heads[index].w, self.heads[index].h);
+                if index != self.selected {
+                    // A shared DRM fd carries flips for every head. Drain any
+                    // pending event before changing which head receives UI work.
+                    if let Err(error) = self.settle_all() {
+                        eprintln!("could not settle display flips before selecting {requested_display}: {error:#}; keeping the current head");
+                        return Ok((self, false));
+                    }
+                    self.selected = index;
+                }
+                return Ok((self, changed));
+            }
+            // A configured multi-head surface is kept intact on an unknown
+            // route rather than tearing down a panel that may still serve touch.
+            if self.heads.len() > 1 {
+                return Ok((self, false));
+            }
             if self.is_dsi_display(requested_display) {
                 return Ok((self, false));
             }
@@ -964,7 +1619,7 @@ pub mod kms {
                 return Ok((self, false));
             }
             drop(self);
-            match Self::open(&path, requested_display) {
+            match Self::open_with_panels(&path, requested_display, panel_rotations) {
                 Ok(next) => {
                     let changed = super::reopened_panel_changed(
                         previous_identity,
@@ -980,7 +1635,7 @@ pub mod kms {
                     }
                     Ok((next, changed))
                 }
-                Err(switch_error) => match Self::open(&path, previous) {
+                Err(switch_error) => match Self::open_with_panels(&path, previous, panel_rotations) {
                     Ok(previous_panel) => {
                         let changed = super::reopened_panel_changed(
                             previous_identity,
@@ -1010,7 +1665,9 @@ pub mod kms {
         }
 
         pub fn is_off(&self) -> bool {
-            self.power == Power::Off
+            // Multi-head surfaces intentionally stay active so either touch
+            // controller can still route to its display while the UI is up.
+            self.heads.iter().all(|head| head.power == Power::Off)
         }
 
         /// Let the panel rest, ready to light again at once: in its
@@ -1022,6 +1679,9 @@ pub mod kms {
         /// turns off. A touch controller that follows the panel, as
         /// Xiaomi's do, rests with it either way.
         pub fn rest(&mut self) -> Result<()> {
+            if !super::can_power_down_heads(self.heads.len()) {
+                return Ok(());
+            }
             if self.power != Power::On {
                 return Ok(());
             }
@@ -1038,6 +1698,9 @@ pub mod kms {
         /// it stop drawing power. The next frame presented turns it on
         /// again.
         pub fn turn_off(&mut self) -> Result<()> {
+            if !super::can_power_down_heads(self.heads.len()) {
+                return Ok(());
+            }
             if self.power == Power::Off {
                 return Ok(());
             }
@@ -1081,14 +1744,6 @@ pub mod kms {
         }
     }
 
-    impl Drop for KmsSurface {
-        fn drop(&mut self) {
-            for buf in &self.bufs {
-                unsafe { libc::munmap(buf.map.cast(), buf.len) };
-            }
-        }
-    }
-
     impl Surface for KmsSurface {
         fn size(&self) -> (u32, u32) {
             (self.w, self.h)
@@ -1110,20 +1765,16 @@ pub mod kms {
             let order = self.order;
             let buf = &self.bufs[self.back];
             let pitch = buffer::Buffer::pitch(&buf.db) as usize;
-            let row = self.w as usize * 4;
             let dst = unsafe { std::slice::from_raw_parts_mut(buf.map, buf.len) };
-            for y in 0..self.h as usize {
-                let src = &canvas.data[y * row..(y + 1) * row];
-                let out = &mut dst[y * pitch..y * pitch + row];
-                match order {
-                    Order::Rgba => out.copy_from_slice(src),
-                    Order::Bgra => {
-                        for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
-                            *o = [s[2], s[1], s[0], s[3]];
-                        }
-                    }
-                }
-            }
+            super::copy_scanout_frame(
+                &canvas.data,
+                dst,
+                self.w,
+                self.h,
+                pitch,
+                self.display_rotation == 180,
+                matches!(order, Order::Bgra),
+            );
             let mut req = atomic::AtomicModeReq::new();
             for &(plane, fb_prop) in &self.planes {
                 req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(buf.fb)));
@@ -1144,7 +1795,7 @@ pub mod kms {
                 }
                 flags |= AtomicCommitFlags::ALLOW_MODESET;
             }
-            self.settle()?;
+            self.settle_all()?;
             self.card.atomic_commit(flags, req).context(if self.power == Power::On { "flip" } else { "turn the display on" })?;
             if self.power == Power::Off {
                 self.slow = self.fastest.is_some();
@@ -1156,11 +1807,7 @@ pub mod kms {
         }
 
         fn settle(&mut self) -> Result<()> {
-            if self.flipping {
-                flipped(&self.card).context("flip")?;
-                self.flipping = false;
-            }
-            Ok(())
+            self.settle_all()
         }
     }
 }

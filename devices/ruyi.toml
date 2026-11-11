@@ -35,6 +35,10 @@ device = "goodix_ts"
 display_index = 1
 width = 1208
 height = 1392
+# The cover display and touch controller both report upside-down coordinates;
+# keep their independent transforms explicit in case they differ on another build.
+display_rotation = 180
+touch_rotation = 180
 
 # The stock fstab mounts modem at /vendor/firmware_mnt and persist at
 # /mnt/vendor/persist. The vendor image points the WLAN settings and MAC

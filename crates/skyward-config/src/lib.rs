@@ -317,6 +317,12 @@ pub struct TouchPanel {
     /// Preferred mode dimensions on that display.
     pub width: u32,
     pub height: u32,
+    /// Rotation applied to the scanout image, independent of touch mapping.
+    #[serde(default)]
+    pub display_rotation: u16,
+    /// Rotation applied to raw touch coordinates, independent of scanout.
+    #[serde(default)]
+    pub touch_rotation: u16,
 }
 
 /// The touchscreen, on phones whose touch controller is to be told
@@ -522,6 +528,18 @@ impl DeviceConfig {
         for panel in &cfg.touch.panels {
             ensure!(!panel.device.is_empty(), "[touch] panels: device name is empty");
             ensure!(panel.width > 0 && panel.height > 0, "[touch] panels: {} has zero display size", panel.device);
+            ensure!(
+                matches!(panel.display_rotation, 0 | 180),
+                "[touch] panels: {} has unsupported display rotation {}",
+                panel.device,
+                panel.display_rotation
+            );
+            ensure!(
+                matches!(panel.touch_rotation, 0 | 180),
+                "[touch] panels: {} has unsupported touch rotation {}",
+                panel.device,
+                panel.touch_rotation
+            );
             ensure!(!touch_devices.contains(&panel.device.as_str()), "[touch] panels: {} is listed more than once", panel.device);
             ensure!(
                 !touch_displays.contains(&panel.display_index),
@@ -722,9 +740,31 @@ mod tests {
         assert_eq!(config.touch.panels.len(), 2);
         assert_eq!(
             config.touch.panels[0],
-            TouchPanel { device: "synaptics_tcm_touch".into(), display_index: 0, width: 1224, height: 2912 }
+            TouchPanel { device: "synaptics_tcm_touch".into(), display_index: 0, width: 1224, height: 2912, display_rotation: 0, touch_rotation: 0 }
         );
-        assert_eq!(config.touch.panels[1], TouchPanel { device: "goodix_ts".into(), display_index: 1, width: 1208, height: 1392 });
+        assert_eq!(
+            config.touch.panels[1],
+            TouchPanel { device: "goodix_ts".into(), display_index: 1, width: 1208, height: 1392, display_rotation: 180, touch_rotation: 180 }
+        );
+    }
+
+    #[test]
+    fn ruyi_declares_independent_rotation_for_the_outer_display_and_touchscreen() {
+        let config: toml::Value = toml::from_str(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let panels = config["touch"]["panels"].as_array().unwrap();
+        assert_eq!(panels[1].get("display_rotation").and_then(toml::Value::as_integer), Some(180));
+        assert_eq!(panels[1].get("touch_rotation").and_then(toml::Value::as_integer), Some(180));
+    }
+
+    #[test]
+    fn rejects_panel_rotations_the_kms_and_touch_mapping_do_not_support() {
+        for field in ["display_rotation", "touch_rotation"] {
+            let text = include_str!("../../../devices/ruyi.toml").replace(
+                "height = 1392",
+                &format!("height = 1392\n{field} = 90"),
+            );
+            assert!(DeviceConfig::parse(&text).is_err(), "{field}=90 must be rejected");
+        }
     }
 
     #[test]

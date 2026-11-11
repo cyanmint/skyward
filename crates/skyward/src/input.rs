@@ -162,8 +162,13 @@ impl Panel {
                     let at = time.tv_sec as u64 * 1000 + time.tv_usec as u64 / 1000;
                     let target = self.target.clone();
                     let (target_w, target_h) = target.as_ref().map_or((w as u32, h as u32), |p| (p.width, p.height));
-                    let x = skyward_ui::touch::map_axis(self.raw.0, self.x_range, target_w);
-                    let y = skyward_ui::touch::map_axis(self.raw.1, self.y_range, target_h);
+                    let rotation = target.as_ref().map_or(0, |panel| panel.touch_rotation);
+                    let (x, y) = skyward_ui::touch::map_touch_point(
+                        self.raw,
+                        (self.x_range, self.y_range),
+                        (target_w, target_h),
+                        rotation,
+                    );
                     match (self.was_down, self.down) {
                         (false, true) => out.push(Event::Touch(Touch::Down(x, y), at, target.clone())),
                         (true, true) if self.moved => out.push(Event::Touch(Touch::Move(x, y), at, target.clone())),
