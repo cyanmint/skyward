@@ -1007,11 +1007,22 @@ pub mod kms {
         Off,
     }
 
+    type HeadAllocation = (u32, Vec<u32>);
+    type HeadResourceChoices = (usize, Vec<HeadAllocation>);
+
+    struct HeadSetup<'a> {
+        panel_identity: PanelIdentity,
+        display_index: u32,
+        panel_rotations: &'a [(u32, u16)],
+        allocation: Option<HeadAllocation>,
+        disable_other_panels: bool,
+    }
+
     fn head_resource_choices(
         card: &Card,
         resources: &drm::control::ResourceHandles,
         conn: &connector::Info,
-    ) -> Result<(usize, Vec<(u32, Vec<u32>)>)> {
+    ) -> Result<HeadResourceChoices> {
         let preferred = conn
             .modes()
             .iter()
@@ -1274,7 +1285,16 @@ pub mod kms {
             let panel_identity = (connector.interface() as u32, connector.interface_id());
             let display_index = connector.interface_id().saturating_sub(1);
             Self::open_head_info(
-                card, resources, connector.clone(), panel_identity, display_index, panel_rotations, allocation, disable_other_panels,
+                card,
+                resources,
+                connector.clone(),
+                HeadSetup {
+                    panel_identity,
+                    display_index,
+                    panel_rotations,
+                    allocation,
+                    disable_other_panels,
+                },
             )
         }
 
@@ -1301,20 +1321,28 @@ pub mod kms {
                 .ok_or_else(|| anyhow!("no connected built-in panel"))?;
             let panel_identity = (chosen.interface() as u32, chosen.interface_id());
             let display_index = if chosen.interface() == connector::Interface::DSI { chosen.interface_id().saturating_sub(1) } else { 0 };
-            Self::open_head_info(card, resources, chosen, panel_identity, display_index, panel_rotations, allocation, true)
+            Self::open_head_info(
+                card,
+                resources,
+                chosen,
+                HeadSetup {
+                    panel_identity,
+                    display_index,
+                    panel_rotations,
+                    allocation,
+                    disable_other_panels: true,
+                },
+            )
         }
 
         fn open_head_info(
             card: std::sync::Arc<Card>,
             res: drm::control::ResourceHandles,
             conn: connector::Info,
-            panel_identity: PanelIdentity,
-            display_index: u32,
-            panel_rotations: &[(u32, u16)],
-            allocation: Option<(u32, Vec<u32>)>,
-            disable_other_panels: bool,
+            setup: HeadSetup<'_>,
         ) -> Result<KmsHead> {
-            let display_rotation = super::rotation_for_display(display_index, panel_rotations);
+            let display_rotation =
+                super::rotation_for_display(setup.display_index, setup.panel_rotations);
             let preferred = conn
                 .modes()
                 .iter()
@@ -1338,7 +1366,7 @@ pub mod kms {
                 Some(e) => card.get_encoder(e).context("read encoder")?.crtc(),
                 None => None,
             };
-            let crtc = if let Some((id, _)) = &allocation {
+            let crtc = if let Some((id, _)) = &setup.allocation {
                 res.crtcs()
                     .iter()
                     .copied()
@@ -1386,7 +1414,7 @@ pub mod kms {
             // Primary planes must be usable without disabling another CRTC.
             // Multi-head opens pass a globally disjoint allocation from the
             // planner; single-head opens keep the existing preferred order.
-            let assigned = allocation.as_ref().map(|(_, ids)| ids);
+            let assigned = setup.allocation.as_ref().map(|(_, ids)| ids);
             let mut candidates: Vec<(plane::Handle, Vec<u32>, Props, bool)> = Vec::new();
             let mut attached = Vec::new();
             for p in card.plane_handles().context("list planes")? {
@@ -1464,7 +1492,7 @@ pub mod kms {
                     connector_crtc_props.push((handle, crtc_property));
                 }
             }
-            let connectors_to_detach = if disable_other_panels {
+            let connectors_to_detach = if setup.disable_other_panels {
                 super::other_panel_connectors_to_disable(&panel_assignments, selected_connector)
             } else {
                 super::connectors_to_disable(&panel_assignments, selected_connector, u32::from(crtc))
@@ -1596,8 +1624,8 @@ pub mod kms {
             let spr = spr.map(|(id, setup, _)| (id, setup));
             let conn = conn.handle();
             Ok(KmsHead {
-                display_index,
-                panel_identity,
+                display_index: setup.display_index,
+                panel_identity: setup.panel_identity,
                 display_rotation,
                 bufs,
                 back: 1,

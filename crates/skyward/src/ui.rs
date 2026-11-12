@@ -1092,22 +1092,38 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
     Ok(())
 }
 
-fn render_panel_view(
-    surface: &mut KmsSurface,
+struct PanelRenderContext<'a> {
     display_index: u32,
-    app: &mut App,
-    screen: &mut Canvas,
+    app: &'a mut App,
+    screen: &'a mut Canvas,
     enabled: bool,
     idle_power_down_allowed: bool,
-    blanked: &mut bool,
-    rested_at: &mut Option<Instant>,
+    blanked: &'a mut bool,
+    rested_at: &'a mut Option<Instant>,
     settle_before_light: bool,
-    fonts: &Fonts,
-    info: &skyward_info::DeviceInfo,
-    shown_clock: &str,
+    fonts: &'a Fonts,
+    info: &'a skyward_info::DeviceInfo,
+    shown_clock: &'a str,
     now: u64,
-    dump: Option<&Path>,
-) -> Result<(bool, Option<f32>)> {
+    dump: Option<&'a Path>,
+}
+
+fn render_panel_view(surface: &mut KmsSurface, context: PanelRenderContext<'_>) -> Result<(bool, Option<f32>)> {
+    let PanelRenderContext {
+        display_index,
+        app,
+        screen,
+        enabled,
+        idle_power_down_allowed,
+        blanked,
+        rested_at,
+        settle_before_light,
+        fonts,
+        info,
+        shown_clock,
+        now,
+        dump,
+    } = context;
     let panel = if enabled { app.panel(now) } else { None };
     let mut shown = false;
     if panel.is_some() {
@@ -1648,19 +1664,21 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         let primary_display = primary_panel.as_ref().map_or(primary_display_index, |panel| panel.display_index);
         let (primary_shown, primary_light) = render_panel_view(
             &mut surface,
-            primary_display,
-            &mut app,
-            &mut screen,
-            primary_enabled,
-            idle_power_down_allowed,
-            &mut blanked,
-            &mut rested_at,
-            backlight.level == 0,
-            &fonts,
-            &info,
-            &shown_clock,
-            now,
-            dump,
+            PanelRenderContext {
+                display_index: primary_display,
+                app: &mut app,
+                screen: &mut screen,
+                enabled: primary_enabled,
+                idle_power_down_allowed,
+                blanked: &mut blanked,
+                rested_at: &mut rested_at,
+                settle_before_light: backlight.level == 0,
+                fonts: &fonts,
+                info: &info,
+                shown_clock: &shown_clock,
+                now,
+                dump,
+            },
         )?;
         let mut shown = primary_shown;
         let mut backlight_level = primary_light;
@@ -1668,19 +1686,21 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             let enabled = mode.includes_role(view.panel.role);
             let (view_shown, light) = render_panel_view(
                 &mut surface,
-                view.panel.display_index,
-                &mut view.app,
-                &mut view.screen,
-                enabled,
-                idle_power_down_allowed,
-                &mut view.blanked,
-                &mut view.rested_at,
-                backlight.level == 0,
-                &fonts,
-                &info,
-                &shown_clock,
-                now,
-                None,
+                PanelRenderContext {
+                    display_index: view.panel.display_index,
+                    app: &mut view.app,
+                    screen: &mut view.screen,
+                    enabled,
+                    idle_power_down_allowed,
+                    blanked: &mut view.blanked,
+                    rested_at: &mut view.rested_at,
+                    settle_before_light: backlight.level == 0,
+                    fonts: &fonts,
+                    info: &info,
+                    shown_clock: &shown_clock,
+                    now,
+                    dump: None,
+                },
             )?;
             shown |= view_shown;
             if let Some(light) = light {
@@ -2442,7 +2462,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             let mut refresh_all_views = false;
             let mut enter_recovery_all_views = false;
             {
-                let mut app = app_view_mut(&mut app, &mut display_views, target_view);
+                let app = app_view_mut(&mut app, &mut display_views, target_view);
             // What the pages ask for in answer to the work done goes on
             // after it.
             let mut queue = VecDeque::from(effects);
@@ -2466,10 +2486,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::FactoryReset => {
                         ensure!(eraser.is_none(), "erasing is under way already");
-                        if !withhold(&mut transfer, &mut app, now)? {
+                        if !withhold(&mut transfer, app, now)? {
                             continue;
                         }
-                        eraser = Some(factory_reset(&mut app, request.keep_memtag_mode, true, None)?);
+                        eraser = Some(factory_reset(app, request.keep_memtag_mode, true, None)?);
                         erase_leaves = true;
                     }
                     // Opening the data partition and erasing it are not to
@@ -2480,18 +2500,18 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             app.report(app.state.lang.pick(DATA_OPENING), now);
                             continue;
                         }
-                        if !withhold(&mut transfer, &mut app, now)? {
+                        if !withhold(&mut transfer, app, now)? {
                             continue;
                         }
                         erase_leaves = false;
                         if chosen.contains(&Wipe::All) {
-                            eraser = Some(factory_reset(&mut app, false, false, None)?);
+                            eraser = Some(factory_reset(app, false, false, None)?);
                         } else if chosen.iter().any(|&w| w != Wipe::Cache) && app.state.data == Data::Erased {
                             app.erase_started(false, false, Vec::new());
                             app.erase_ended(Err(EraseStop::Erased), now);
                         } else {
                             let steps = chosen.into_iter().map(step).collect();
-                            eraser = Some(parts_wipe(&mut app, steps, &cfg.wipe.logs, false, None)?);
+                            eraser = Some(parts_wipe(app, steps, &cfg.wipe.logs, false, None)?);
                         }
                     }
                     Effect::Install => installer.as_ref().context("no installer holds an update")?.install(),
@@ -2567,25 +2587,25 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::Sideload => {
                         ensure!(installer.is_none(), "an installer is running already");
-                        if !withhold(&mut transfer, &mut app, now)? {
+                        if !withhold(&mut transfer, app, now)? {
                             continue;
                         }
-                        installer = Some(Installer::start(detach(cfg.services.clone()), install_options(&app))?);
+                        installer = Some(Installer::start(detach(cfg.services.clone()), install_options(app))?);
                         sideloading = true;
                     }
                     Effect::InstallFile(place, path) => {
                         ensure!(installer.is_none(), "an installer is running already");
-                        if !withhold(&mut transfer, &mut app, now)? {
+                        if !withhold(&mut transfer, app, now)? {
                             continue;
                         }
-                        installer = Some(Installer::open(in_place(place, &path), detach(cfg.services.clone()), install_options(&app))?);
+                        installer = Some(Installer::open(in_place(place, &path), detach(cfg.services.clone()), install_options(app))?);
                     }
                     Effect::InstallPath(path) => {
                         ensure!(installer.is_none(), "an installer is running already");
-                        if !withhold(&mut transfer, &mut app, now)? {
+                        if !withhold(&mut transfer, app, now)? {
                             continue;
                         }
-                        installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app))?);
+                        installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(app))?);
                     }
                     Effect::Flash { partition, pick } => {
                         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
@@ -2641,8 +2661,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.into_bytes() };
                         decryptor = Some(Decryptor::start(job)?);
                     }
-                    Effect::ReadDir(folder) => list(&mut app, folder)?,
-                    Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
+                    Effect::ReadDir(folder) => list(app, folder)?,
+                    Effect::ReadPlace(place, folder) => list_place(app, place, folder)?,
                     // A name taken where an entry goes is the user's to
                     // decide on before anything is written.
                     Effect::Paste { op, path, into, clash } => {
@@ -2713,14 +2733,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             app.report(app.state.lang.pick(DATA_OPENING), now);
                             continue;
                         }
-                        if name == DATA_PARTITION && !withhold(&mut transfer, &mut app, now)? {
+                        if name == DATA_PARTITION && !withhold(&mut transfer, app, now)? {
                             continue;
                         }
                         let part = fs_part(&name)?;
                         let (kind, task) = match action {
                             FsAction::Remake(filesystem) if name == DATA_PARTITION => {
                                 erase_leaves = false;
-                                eraser = Some(factory_reset(&mut app, false, false, Some(filesystem))?);
+                                eraser = Some(factory_reset(app, false, false, Some(filesystem))?);
                                 continue;
                             }
                             FsAction::Repair => (PartKind::Repair, partwork::Task::Repair(part)),
@@ -2781,7 +2801,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         backuper = Some(backup::Worker::start(backup::Task::Restore(task))?);
                         app.backup_started(true, place, true);
                     }
-                    Effect::FindBackups { storage, usb } => find_backups(&mut app, storage, usb, now),
+                    Effect::FindBackups { storage, usb } => find_backups(app, storage, usb, now),
                     Effect::DeleteBackup { place, name } => {
                         let deleted = delete_backup(place, &backups_in(place).join(&name)).map_err(|e| format!("{e:#}"));
                         queue.extend(app.backup_deleted(deleted, now));
@@ -2834,7 +2854,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                                 let task = updates::Task::Download { server, installed, release, path };
                                 downloader = Some(updates::Worker::start(task, servers.clone())?);
                             }
-                            Err(e) => app.download_ended(DownloadEnd::Failed(Failure::Other(format!("{e:#}"))), have(&app, &release), now),
+                            Err(e) => app.download_ended(DownloadEnd::Failed(Failure::Other(format!("{e:#}"))), have(app, &release), now),
                         }
                     }
                     Effect::StopDownload => downloader.as_ref().context("there is no download to stop")?.stop(),
@@ -2882,7 +2902,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         Ok(()) => {
                             app.text_saved(Ok(()), now);
                             let folder = app.state.files.path.clone();
-                            list(&mut app, folder)?;
+                            list(app, folder)?;
                         }
                         Err(e) => app.text_saved(Err(format!("{e:#}")), now),
                     },
@@ -2890,7 +2910,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         Ok(_) => {
                             app.renamed(Ok(()), now);
                             let folder = app.state.files.path.clone();
-                            list(&mut app, folder)?;
+                            list(app, folder)?;
                         }
                         Err(e) if e.is::<skyward_files::Taken>() => app.renamed(Err(RenameRefused::Taken), now),
                         Err(e) => app.renamed(Err(RenameRefused::Failed(format!("{e:#}"))), now),
