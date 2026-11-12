@@ -2363,7 +2363,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         ) {
                             focused_display_index = target.display_index;
                             target_view = view_index;
-                            app_view_mut(&mut app, &mut display_views, view_index).touch(t, &fonts, at)
+                            app_view_mut(&mut app, &mut display_views, view_index)
+                                .touch(t, &fonts, at)
                         } else {
                             Vec::new()
                         }
@@ -2381,9 +2382,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         display_views
                             .iter()
                             .position(|view| {
-                                view.panel.display_index == focused_display_index && mode.includes_role(view.panel.role)
+                                view.panel.display_index == focused_display_index
+                                    && mode.includes_role(view.panel.role)
                             })
-                            .or_else(|| display_views.iter().position(|view| mode.includes_role(view.panel.role)))
+                            .or_else(|| {
+                                display_views
+                                    .iter()
+                                    .position(|view| mode.includes_role(view.panel.role))
+                            })
                     };
                     if primary_enabled {
                         app.key(k, now)
@@ -2405,9 +2411,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         display_views
                             .iter()
                             .position(|view| {
-                                view.panel.display_index == focused_display_index && mode.includes_role(view.panel.role)
+                                view.panel.display_index == focused_display_index
+                                    && mode.includes_role(view.panel.role)
                             })
-                            .or_else(|| display_views.iter().position(|view| mode.includes_role(view.panel.role)))
+                            .or_else(|| {
+                                display_views
+                                    .iter()
+                                    .position(|view| mode.includes_role(view.panel.role))
+                            })
                     };
                     if primary_enabled {
                         app.key_up(k, now)
@@ -2422,7 +2433,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             let screenshot_canvas = effects
                 .iter()
                 .any(|fx| matches!(fx, Effect::Screenshot { .. }))
-                .then(|| target_view.map_or_else(|| screen.clone(), |index| display_views[index].screen.clone()));
+                .then(|| {
+                    target_view.map_or_else(
+                        || screen.clone(),
+                        |index| display_views[index].screen.clone(),
+                    )
+                });
             let mut refresh_all_views = false;
             let mut enter_recovery_all_views = false;
             {
@@ -3087,11 +3103,26 @@ mod display_mode_tests {
     fn touches_route_only_to_the_matching_enabled_panel() {
         let config = ruyi();
         let panels = &config.touch.panels;
-        assert_eq!(touch_panel_for_display(DisplayMode::Both, 0, panels).map(|panel| panel.role), Some(PanelRole::Internal));
-        assert_eq!(touch_panel_for_display(DisplayMode::Both, 1, panels).map(|panel| panel.role), Some(PanelRole::External));
-        assert_eq!(touch_panel_for_display(DisplayMode::InternalOnly, 1, panels), None);
-        assert_eq!(touch_panel_for_display(DisplayMode::ExternalOnly, 0, panels), None);
-        assert_eq!(touch_panel_for_display(DisplayMode::ExternalOnly, 1, panels).map(|panel| panel.role), Some(PanelRole::External));
+        assert_eq!(
+            touch_panel_for_display(DisplayMode::Both, 0, panels).map(|panel| panel.role),
+            Some(PanelRole::Internal)
+        );
+        assert_eq!(
+            touch_panel_for_display(DisplayMode::Both, 1, panels).map(|panel| panel.role),
+            Some(PanelRole::External)
+        );
+        assert_eq!(
+            touch_panel_for_display(DisplayMode::InternalOnly, 1, panels),
+            None
+        );
+        assert_eq!(
+            touch_panel_for_display(DisplayMode::ExternalOnly, 0, panels),
+            None
+        );
+        assert_eq!(
+            touch_panel_for_display(DisplayMode::ExternalOnly, 1, panels).map(|panel| panel.role),
+            Some(PanelRole::External)
+        );
     }
 
     #[test]

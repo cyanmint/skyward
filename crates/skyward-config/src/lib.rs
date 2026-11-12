@@ -320,18 +320,13 @@ pub enum PanelRole {
 }
 
 /// Which configured panels show the recovery's pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplayMode {
     InternalOnly,
     ExternalOnly,
+    #[default]
     Both,
-}
-
-impl Default for DisplayMode {
-    fn default() -> Self {
-        Self::Both
-    }
 }
 
 impl<'de> Deserialize<'de> for DisplayMode {
@@ -380,10 +375,7 @@ pub struct TouchPanel {
 }
 
 /// Panels the selected mode enables, in device-configuration order.
-pub fn panels_for_display_mode<'a>(
-    mode: DisplayMode,
-    panels: &'a [TouchPanel],
-) -> Vec<&'a TouchPanel> {
+pub fn panels_for_display_mode(mode: DisplayMode, panels: &[TouchPanel]) -> Vec<&TouchPanel> {
     panels
         .iter()
         .filter(|panel| mode.includes_role(panel.role))
@@ -400,10 +392,10 @@ pub fn enabled_panel_count(mode: DisplayMode, panels: &[TouchPanel]) -> usize {
 
 /// The panel to open first for this mode, preferring the inner panel for
 /// both displays and falling back to the first configured panel.
-pub fn primary_panel_for_display_mode<'a>(
+pub fn primary_panel_for_display_mode(
     mode: DisplayMode,
-    panels: &'a [TouchPanel],
-) -> Option<&'a TouchPanel> {
+    panels: &[TouchPanel],
+) -> Option<&TouchPanel> {
     let preferred_role = match mode {
         DisplayMode::ExternalOnly => PanelRole::External,
         DisplayMode::InternalOnly | DisplayMode::Both => PanelRole::Internal,
@@ -415,14 +407,14 @@ pub fn primary_panel_for_display_mode<'a>(
 }
 
 /// The configured touchscreen for a display, unless that display is disabled.
-pub fn touch_panel_for_display<'a>(
+pub fn touch_panel_for_display(
     mode: DisplayMode,
     display_index: u32,
-    panels: &'a [TouchPanel],
-) -> Option<&'a TouchPanel> {
-    panels.iter().find(|panel| {
-        panel.display_index == display_index && mode.includes_role(panel.role)
-    })
+    panels: &[TouchPanel],
+) -> Option<&TouchPanel> {
+    panels
+        .iter()
+        .find(|panel| panel.display_index == display_index && mode.includes_role(panel.role))
 }
 
 /// Whether the settings page can offer all three display-mode choices.
