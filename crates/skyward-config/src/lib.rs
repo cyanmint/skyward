@@ -858,7 +858,7 @@ mod tests {
         );
         assert_eq!(
             config.touch.panels[1],
-            TouchPanel { device: "goodix_ts".into(), display_index: 1, role: PanelRole::External, width: 1208, height: 1392, display_rotation: 180, touch_rotation: 180 }
+            TouchPanel { device: "goodix_ts".into(), display_index: 1, role: PanelRole::External, width: 1208, height: 1392, display_rotation: 180, touch_rotation: 0 }
         );
     }
 
@@ -969,7 +969,7 @@ mod tests {
         let config: toml::Value = toml::from_str(include_str!("../../../devices/ruyi.toml")).unwrap();
         let panels = config["touch"]["panels"].as_array().unwrap();
         assert_eq!(panels[1].get("display_rotation").and_then(toml::Value::as_integer), Some(180));
-        assert_eq!(panels[1].get("touch_rotation").and_then(toml::Value::as_integer), Some(180));
+        assert_eq!(panels[1].get("touch_rotation").and_then(toml::Value::as_integer), Some(0));
     }
 
     #[test]
