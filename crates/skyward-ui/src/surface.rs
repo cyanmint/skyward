@@ -181,29 +181,33 @@ fn primary_first_order(displays: &[u32], requested_display: u32) -> Vec<usize> {
 }
 
 #[cfg(any(target_os = "android", test))]
-fn open_heads_with_primary_fallback<T>(
-    open_order: &[usize],
-    mut open: impl FnMut(usize) -> Result<T>,
-) -> Result<Vec<T>> {
+fn open_all_heads<T>(open_order: &[usize], mut open: impl FnMut(usize) -> Result<T>) -> Result<Vec<T>> {
     let mut heads = Vec::with_capacity(open_order.len());
     for &index in open_order {
         match open(index) {
             Ok(head) => heads.push(head),
-            Err(error) if heads.is_empty() => return Err(error),
-            Err(error) => {
-                eprintln!("could not open an additional display: {error:#}; keeping the requested primary head active");
-                return Ok(heads);
-            }
+            Err(error) => return Err(anyhow::anyhow!("display at index {index} failed to open: {error:#}")),
         }
     }
     Ok(heads)
 }
 
 #[cfg(any(target_os = "android", test))]
-fn with_single_head_fallback<T>(dual: Result<T>, fallback: impl FnOnce(anyhow::Error) -> Result<T>) -> Result<T> {
+fn with_single_head_fallback<T>(
+    dual: Result<T>,
+    fallback: impl FnOnce(anyhow::Error) -> Result<T>,
+) -> Result<(T, Option<String>)> {
     match dual {
-        Ok(value) => Ok(value),
-        Err(error) => fallback(error),
+        Ok(value) => Ok((value, None)),
+        Err(error) => {
+            let diagnostic = format!("{error:#}");
+            match fallback(error) {
+                Ok(value) => Ok((value, Some(diagnostic))),
+                Err(fallback_error) => Err(anyhow::anyhow!(
+                    "dual-head setup failed ({diagnostic}); single-head fallback failed ({fallback_error:#})"
+                )),
+            }
+        }
     }
 }
 
@@ -211,7 +215,7 @@ fn with_single_head_fallback<T>(dual: Result<T>, fallback: impl FnOnce(anyhow::E
 fn other_panel_connectors_to_disable(attached: &[(u32, u32)], selected: u32) -> Vec<u32> {
     attached
         .iter()
-        .filter_map(|(connector, _)| (*connector != selected).then_some(*connector))
+        .filter_map(|(connector, crtc)| (*connector != selected && *crtc != 0).then_some(*connector))
         .collect()
 }
 
@@ -239,6 +243,33 @@ fn crtcs_to_disable(assignments: &[(u32, u32)], changed_connectors: &[u32], targ
         }
     }
     disabled
+}
+
+#[cfg(any(target_os = "android", test))]
+fn crtcs_to_disable_with_panel_orphans(
+    assignments: &[(u32, u32)],
+    changed_connectors: &[u32],
+    target_crtc: u32,
+    active_panel_crtcs: &[u32],
+) -> Vec<u32> {
+    let mut disabled = crtcs_to_disable(assignments, changed_connectors, target_crtc);
+    for &crtc in active_panel_crtcs {
+        if crtc == 0 || crtc == target_crtc || disabled.contains(&crtc) {
+            continue;
+        }
+        let has_surviving_connector = assignments
+            .iter()
+            .any(|(connector, assigned)| *assigned == crtc && !changed_connectors.contains(connector));
+        if !has_surviving_connector {
+            disabled.push(crtc);
+        }
+    }
+    disabled
+}
+
+#[cfg(any(target_os = "android", test))]
+fn disabled_crtc_atomic_values() -> (u64, bool) {
+    (0, false)
 }
 
 /// Keep enabled scanouts and their touch controllers live in multi-head mode.
@@ -599,10 +630,34 @@ mod tests {
     }
 
     #[test]
+    fn single_head_fallback_leaves_unbound_panel_connectors_untouched() {
+        let attached = [(14, 211), (15, 0), (16, 275)];
+        assert_eq!(other_panel_connectors_to_disable(&attached, 14), [16]);
+    }
+
+    #[test]
     fn only_disable_crtcs_without_a_surviving_connector() {
         let assignments = [(14, 211), (15, 275), (16, 275), (17, 293)];
         assert_eq!(crtcs_to_disable(&assignments, &[15], 211), Vec::<u32>::new());
         assert_eq!(crtcs_to_disable(&assignments, &[15, 16], 211), [275]);
+    }
+
+    #[test]
+    fn disabling_a_crtc_clears_its_mode_blob() {
+        assert_eq!(disabled_crtc_atomic_values(), (0, false));
+    }
+
+    #[test]
+    fn orphaned_active_panel_crtcs_are_disabled_without_disturbing_assigned_heads() {
+        let assignments = [(14, 211), (15, 0), (18, 275)];
+        assert_eq!(
+            crtcs_to_disable_with_panel_orphans(&assignments, &[], 211, &[275, 284]),
+            [284]
+        );
+        assert_eq!(
+            crtcs_to_disable_with_panel_orphans(&assignments, &[18], 211, &[275, 284]),
+            [275, 284]
+        );
     }
 
     #[test]
@@ -612,33 +667,47 @@ mod tests {
     }
 
     #[test]
-    fn secondary_open_failure_keeps_requested_primary_as_single_head() {
+    fn secondary_open_failure_is_preserved_when_using_the_single_head_fallback() {
         let open_order = [1, 0];
         let mut fallback_called = false;
-        let opened = open_heads_with_primary_fallback(&open_order, |index| {
+        let opened = open_all_heads(&open_order, |index| {
             if index == 1 {
                 Ok("requested primary")
             } else {
-                Err(anyhow::anyhow!("secondary head failed"))
+                Err(anyhow::anyhow!("secondary head atomic commit failed"))
             }
         });
-        let result = with_single_head_fallback(opened, |_| {
+        let (heads, diagnostic) = with_single_head_fallback(opened, |error| {
             fallback_called = true;
+            assert!(format!("{error:#}").contains("secondary head atomic commit failed"));
             Ok(vec!["single fallback"])
-        });
-        assert_eq!(result.unwrap(), ["requested primary"]);
-        assert!(!fallback_called);
+        })
+        .unwrap();
+        assert_eq!(heads, ["single fallback"]);
+        assert!(diagnostic.unwrap().contains("secondary head atomic commit failed"));
+        assert!(fallback_called);
     }
 
     #[test]
     fn primary_open_failure_uses_the_single_head_fallback() {
         let open_order = [1, 0];
-        let opened = open_heads_with_primary_fallback(&open_order, |_| Err(anyhow::anyhow!("primary head failed")));
-        let result = with_single_head_fallback(opened, |error| {
+        let opened = open_all_heads(&open_order, |_| Err(anyhow::anyhow!("primary head failed")));
+        let (heads, diagnostic) = with_single_head_fallback(opened, |error| {
             assert!(error.to_string().contains("primary head failed"));
             Ok(vec!["fallback head"])
-        });
-        assert_eq!(result.unwrap(), ["fallback head"]);
+        })
+        .unwrap();
+        assert_eq!(heads, ["fallback head"]);
+        assert!(diagnostic.unwrap().contains("primary head failed"));
+    }
+
+    #[test]
+    fn dual_and_single_head_failures_keep_both_errors() {
+        let dual: Result<Vec<&str>> = Err(anyhow::anyhow!("secondary atomic commit: EINVAL"));
+        let error = with_single_head_fallback(dual, |_| Err(anyhow::anyhow!("single atomic commit: EBUSY"))).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("secondary atomic commit: EINVAL"));
+        assert!(error.contains("single atomic commit: EBUSY"));
     }
 
     #[test]
@@ -1123,6 +1192,7 @@ pub mod kms {
         path: String,
         heads: Vec<KmsHead>,
         selected: usize,
+        open_error: Option<String>,
     }
 
     impl std::ops::Deref for KmsSurface {
@@ -1148,16 +1218,16 @@ pub mod kms {
         pub fn open_with_panels(path: &str, requested_display: u32, panel_rotations: &[(u32, u16)]) -> Result<Self> {
             let card = std::sync::Arc::new(open_card(path)?);
             let displays: Vec<u32> = panel_rotations.iter().map(|(display, _)| *display).collect();
-            let heads = if displays.len() > 1 {
+            let (heads, open_error) = if displays.len() > 1 {
                 let dual = Self::open_dual_heads(&card, &displays, panel_rotations, requested_display);
                 super::with_single_head_fallback(dual, |error| {
                     eprintln!("could not open all configured displays: {error:#}; falling back to one display");
                     Self::open_head(std::sync::Arc::clone(&card), requested_display, panel_rotations, None).map(|head| vec![head])
                 })?
             } else {
-                vec![Self::open_head(std::sync::Arc::clone(&card), requested_display, panel_rotations, None)?]
+                (vec![Self::open_head(std::sync::Arc::clone(&card), requested_display, panel_rotations, None)?], None)
             };
-            Self::finish_open(path, card, heads, requested_display)
+            Self::finish_open(path, card, heads, requested_display, open_error)
         }
 
         /// Open every configured DSI panel or fail; unlike the legacy opener,
@@ -1199,12 +1269,18 @@ pub mod kms {
             actual.sort_unstable();
             anyhow::ensure!(actual == unique, "opened displays {actual:?}, expected {unique:?}");
             heads.sort_by_key(|head| unique.iter().position(|display| *display == head.display_index).unwrap_or(usize::MAX));
-            Self::finish_open(path, card, heads, requested_display)
+            Self::finish_open(path, card, heads, requested_display, None)
         }
 
-        fn finish_open(path: &str, card: std::sync::Arc<Card>, heads: Vec<KmsHead>, requested_display: u32) -> Result<Self> {
+        fn finish_open(
+            path: &str,
+            card: std::sync::Arc<Card>,
+            heads: Vec<KmsHead>,
+            requested_display: u32,
+            open_error: Option<String>,
+        ) -> Result<Self> {
             let display_indices: Vec<u32> = heads.iter().map(|head| head.display_index).collect();
-            let mut surface = Self { card, path: path.to_owned(), heads, selected: 0 };
+            let mut surface = Self { card, path: path.to_owned(), heads, selected: 0, open_error };
             for selected in 0..surface.heads.len() {
                 surface.selected = selected;
                 if let Err(error) = surface.to_fastest() {
@@ -1263,7 +1339,7 @@ pub mod kms {
             }
             let open_order = super::primary_first_order(displays, requested_display);
             let primary = open_order[0];
-            super::open_heads_with_primary_fallback(&open_order, |index| {
+            super::open_all_heads(&open_order, |index| {
                 Self::open_configured_head(
                     std::sync::Arc::clone(card),
                     &connectors[index],
@@ -1468,6 +1544,30 @@ pub mod kms {
 
             let selected_connector = u32::from(conn.handle());
             let selected_old_crtc = u32::try_from(conn_props.value("CRTC_ID")?).context("read selected connector CRTC ID")?;
+            let mut active_panel_crtcs = Vec::new();
+            for &handle in res.connectors() {
+                let panel = if handle == conn.handle() {
+                    conn.clone()
+                } else {
+                    card.get_connector(handle, false).context("read panel connector resources")?
+                };
+                if !is_panel(panel.interface()) {
+                    continue;
+                }
+                for &encoder in panel.encoders() {
+                    let encoder = card.get_encoder(encoder).context("read panel encoder resources")?;
+                    for candidate in res.filter_crtcs(encoder.possible_crtcs()) {
+                        let id = u32::from(candidate);
+                        if active_panel_crtcs.contains(&id) {
+                            continue;
+                        }
+                        let props = Props::read(&card, candidate)?;
+                        if props.value("ACTIVE")? != 0 || props.value("MODE_ID")? != 0 {
+                            active_panel_crtcs.push(id);
+                        }
+                    }
+                }
+            }
             let mut panel_assignments = Vec::new();
             let mut all_connector_assignments = vec![(selected_connector, selected_old_crtc)];
             let mut connector_crtc_props = Vec::new();
@@ -1501,10 +1601,11 @@ pub mod kms {
             if selected_old_crtc != u32::from(crtc) {
                 changed_connectors.push(selected_connector);
             }
-            let crtcs_to_disable = super::crtcs_to_disable(
+            let crtcs_to_disable = super::crtcs_to_disable_with_panel_orphans(
                 &all_connector_assignments,
                 &changed_connectors,
                 u32::from(crtc),
+                &active_panel_crtcs,
             );
 
             let mut req = atomic::AtomicModeReq::new();
@@ -1516,7 +1617,10 @@ pub mod kms {
                     .find(|candidate| u32::from(*candidate) == old_crtc_id)
                     .ok_or_else(|| anyhow!("connector references missing CRTC {old_crtc_id}"))?;
                 let old_props = Props::read(&card, old_crtc)?;
-                req.add_property(old_crtc, old_props.handle("ACTIVE")?, property::Value::Boolean(false));
+                let (mode_id, active) = (old_props.handle("MODE_ID")?, old_props.handle("ACTIVE")?);
+                let (mode_id_value, active_value) = super::disabled_crtc_atomic_values();
+                req.add_property(old_crtc, mode_id, property::Value::Blob(mode_id_value));
+                req.add_property(old_crtc, active, property::Value::Boolean(active_value));
                 for plane in card.plane_handles().context("list planes")? {
                     if card.get_plane(plane).context("read plane")?.crtc() != Some(old_crtc) {
                         continue;
@@ -1844,6 +1948,14 @@ pub mod kms {
 
         pub fn describe(&self) -> &str {
             &self.summary
+        }
+
+        pub fn describe_all(&self) -> String {
+            self.heads.iter().map(|head| head.summary.as_str()).collect::<Vec<_>>().join("; ")
+        }
+
+        pub fn open_error(&self) -> Option<&str> {
+            self.open_error.as_deref()
         }
 
         pub fn is_on(&self) -> bool {

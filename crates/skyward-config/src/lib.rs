@@ -424,6 +424,11 @@ pub fn supports_display_modes(panels: &[TouchPanel]) -> bool {
     matches!((internal, external), (Some(inner), Some(outer)) if inner.display_index != outer.display_index)
 }
 
+/// Whether a running recovery can offer the configured panel choices.
+pub fn display_mode_selection_available(configured: &[TouchPanel], opened: &[TouchPanel]) -> bool {
+    !opened.is_empty() && supports_display_modes(configured)
+}
+
 /// The mode to apply to opened panels. A saved single-panel choice must not
 /// blank the only panel that opened after a connector failure.
 pub fn effective_display_mode(requested: DisplayMode, opened_panels: &[TouchPanel]) -> DisplayMode {
@@ -908,6 +913,15 @@ mod tests {
         let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
         assert!(supports_display_modes(&config.touch.panels));
         assert!(!supports_display_modes(&[]));
+    }
+
+    #[test]
+    fn display_mode_choices_remain_available_when_only_one_panel_opened() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let opened_panels = [config.touch.panels[0].clone()];
+
+        assert!(display_mode_selection_available(&config.touch.panels, &opened_panels));
+        assert!(!display_mode_selection_available(&config.touch.panels, &[]));
     }
 
     #[test]

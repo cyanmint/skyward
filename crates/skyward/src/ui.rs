@@ -19,8 +19,9 @@ use anyhow::{anyhow, ensure, Context, Result};
 use skyward_block::fsck::Fixed;
 use skyward_block::{fstab, mount, probe};
 use skyward_config::{
-    effective_display_mode, enabled_panel_count, primary_panel_for_display_mode,
-    supports_display_modes, touch_panel_for_display, DeviceConfig, DisplayMode, Service, TouchPanel,
+    display_mode_selection_available, effective_display_mode, enabled_panel_count,
+    primary_panel_for_display_mode, touch_panel_for_display, DeviceConfig, DisplayMode, Service,
+    TouchPanel,
 };
 use skyward_crypto::data::{Closed, Opened};
 use skyward_install::asked::{self, Needs};
@@ -1223,7 +1224,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         .filter(|panel| surface.size_for_display(panel.display_index).is_some())
         .cloned()
         .collect();
-    eprintln!("displays {}", surface.describe());
+    let display_summary = surface.describe_all();
+    eprintln!("displays {display_summary}");
+    skyward_sys::kmsg(&format!("displays {display_summary}"))?;
+    if let Some(error) = surface.open_error() {
+        skyward_sys::kmsg(&format!("display setup fell back to one head: {error}"))?;
+    }
     let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone(), opened_panels.clone())?;
     let started = Instant::now();
     let mut touch_known = false;
@@ -1257,7 +1263,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let locale = request.locale.as_deref().or(info.locale.as_deref());
     let named = locale.map(Lang::for_locale).transpose()?;
     app.take_settings(kept.settings(), named);
-    app.state.display_mode_available = supports_display_modes(&opened_panels);
+    app.state.display_mode_available =
+        display_mode_selection_available(&cfg.touch.panels, &opened_panels);
     let mut keeper = Keeper::new(&kept);
     skyward_sys::kmsg(&format!(
         "the pages speak {:?}, {}, and the locale named is {}",
