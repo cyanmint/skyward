@@ -8,6 +8,7 @@
 use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
+pub use skyward_config::DisplayMode;
 use serde::{Deserialize, Serialize};
 
 /// How long settings stand unchanged before they are written, so a slider
@@ -36,6 +37,8 @@ pub struct Settings {
     /// The language the pages last spoke, as a locale, for a start that
     /// names none, as fastboot's does.
     pub spoken: Option<String>,
+    /// Which built-in panels show the pages; older files default to both.
+    pub display_mode: DisplayMode,
     pub dark: bool,
     /// The brightness slider's place, from 0 at its left end to 1.
     pub brightness: f32,
@@ -119,6 +122,7 @@ impl Settings {
         Settings {
             language: state.language_chosen.then(|| state.lang.tag().to_string()),
             spoken: Some(state.lang.tag().to_string()),
+            display_mode: state.display_mode,
             dark: state.dark,
             brightness: state.brightness,
             screen_off: SCREEN_OFF[state.screen_off].map_or(0, |ms| ms / 1000),
@@ -169,6 +173,7 @@ impl Settings {
             state.lang = lang;
             state.language_chosen = true;
         }
+        state.display_mode = self.display_mode;
         state.dark = self.dark;
         if (0.0..=1.0).contains(&self.brightness) {
             state.brightness = self.brightness;
@@ -323,6 +328,29 @@ mod tests {
         kept.apply(&mut back);
         assert_eq!(Settings::of(&back), Settings::of(&state));
         assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
+    }
+
+    #[test]
+    fn old_settings_without_display_mode_still_enable_both_displays() {
+        let settings = Settings::read(r#"{ "dark": true }"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&settings.text()).unwrap();
+        assert_eq!(json["display_mode"], "both");
+    }
+
+    #[test]
+    fn display_modes_round_trip_and_unknown_values_default_to_both() {
+        for mode in ["internal_only", "external_only", "both"] {
+            let settings = Settings::read(&format!(r#"{{ "display_mode": "{mode}" }}"#)).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&settings.text()).unwrap();
+            assert_eq!(json["display_mode"], mode);
+            let mut state = State::default();
+            settings.apply(&mut state);
+            let applied: serde_json::Value = serde_json::from_str(&Settings::of(&state).text()).unwrap();
+            assert_eq!(applied["display_mode"], mode);
+        }
+        let settings = Settings::read(r#"{ "display_mode": "future_mode" }"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&settings.text()).unwrap();
+        assert_eq!(json["display_mode"], "both");
     }
 
     #[test]

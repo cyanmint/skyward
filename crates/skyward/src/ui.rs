@@ -18,7 +18,10 @@ use crate::wlan;
 use anyhow::{anyhow, ensure, Context, Result};
 use skyward_block::fsck::Fixed;
 use skyward_block::{fstab, mount, probe};
-use skyward_config::{DeviceConfig, Service};
+use skyward_config::{
+    effective_display_mode, enabled_panel_count, primary_panel_for_display_mode,
+    supports_display_modes, touch_panel_for_display, DeviceConfig, DisplayMode, Service, TouchPanel,
+};
 use skyward_crypto::data::{Closed, Opened};
 use skyward_install::asked::{self, Needs};
 use skyward_install::{Detach, Installer, Options};
@@ -35,14 +38,15 @@ use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
 use skyward_systems::Who;
 use skyward_ui::app::{
-    App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
-    FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
-    RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
-    INSTALL_UNFINISHED, USB_DRIVE,
+    app_view_mut, view_index_for_display, App, AppView, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data,
+    DownloadEnd, Effect, EraseStop, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd,
+    Keys, MountFailure, Part, PartKind, PartStop, Place, RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive,
+    UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS, INSTALL_UNFINISHED, USB_DRIVE,
 };
 use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
-use skyward_ui::{Canvas, Fonts, Lang, Surface};
+use skyward_ui::surface::{panel_power_action, PanelPowerAction};
+use skyward_ui::{Canvas, Fonts, Lang};
 use skyward_vab::{Merge, Standing};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
@@ -126,6 +130,51 @@ impl Backlight {
         }
         Ok(())
     }
+}
+
+/// One configured panel's independent navigation, render cache and idle timer.
+struct SecondaryView {
+    panel: TouchPanel,
+    app: App,
+    screen: Canvas,
+    blanked: bool,
+    rested_at: Option<Instant>,
+}
+
+impl AppView for SecondaryView {
+    fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+}
+
+fn redraw_display_views(primary: &mut App, views: &mut [SecondaryView]) {
+    primary.redraw();
+    for view in views {
+        view.app.redraw();
+    }
+}
+
+fn refresh_display_views(primary: &mut App, views: &mut [SecondaryView]) {
+    primary.refresh();
+    for view in views {
+        view.app.refresh();
+    }
+}
+
+fn shell_slot_for_view(view_index: Option<usize>) -> usize {
+    view_index.map_or(0, |index| index + 1)
+}
+
+fn view_for_shell_slot(shell_slot: usize) -> Option<usize> {
+    shell_slot.checked_sub(1)
+}
+
+fn app_for_shell_slot<'a>(
+    primary: &'a mut App,
+    views: &'a mut [SecondaryView],
+    shell_slot: usize,
+) -> &'a mut App {
+    app_view_mut(primary, views, view_for_shell_slot(shell_slot))
 }
 
 /// How a panel's node in the device tree may give its normal maximum: the
@@ -1043,6 +1092,72 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
     Ok(())
 }
 
+fn render_panel_view(
+    surface: &mut KmsSurface,
+    display_index: u32,
+    app: &mut App,
+    screen: &mut Canvas,
+    enabled: bool,
+    idle_power_down_allowed: bool,
+    blanked: &mut bool,
+    rested_at: &mut Option<Instant>,
+    settle_before_light: bool,
+    fonts: &Fonts,
+    info: &skyward_info::DeviceInfo,
+    shown_clock: &str,
+    now: u64,
+    dump: Option<&Path>,
+) -> Result<(bool, Option<f32>)> {
+    let panel = if enabled { app.panel(now) } else { None };
+    let mut shown = false;
+    if panel.is_some() {
+        if app.take_dirty() || !surface.is_on_display(display_index) {
+            let t0 = Instant::now();
+            app.compose(screen, fonts, info, shown_clock, now);
+            surface.present_on(display_index, screen)?;
+            if settle_before_light {
+                surface.settle_on(display_index)?;
+            }
+            eprintln!("display {display_index} frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
+            if let Some(path) = dump {
+                fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
+            }
+            shown = true;
+        }
+        *blanked = false;
+    } else if !*blanked {
+        screen.data.fill(0);
+        surface.present_on(display_index, screen)?;
+        surface.settle_on(display_index)?;
+        *blanked = true;
+    }
+
+    match panel_power_action(
+        enabled,
+        panel.is_some(),
+        idle_power_down_allowed,
+        surface.is_on_display(display_index),
+        rested_at.is_some_and(|at| at.elapsed() >= REST),
+    ) {
+        PanelPowerAction::Off => {
+            if !surface.is_off_display(display_index) {
+                surface.turn_off_on(display_index)?;
+            }
+            *rested_at = None;
+        }
+        PanelPowerAction::Active => {
+            surface.speed_up_on(display_index)?;
+            *rested_at = None;
+        }
+        PanelPowerAction::Rest => {
+            surface.rest_on(display_index)?;
+            *rested_at = Some(Instant::now());
+        }
+        PanelPowerAction::Keep => {}
+    }
+    Ok((shown, panel))
+}
+
 /// Run the pages. What `request`, read from misc, asks for decides the
 /// first of them; asking for nothing, they start at `start`.
 pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
@@ -1051,16 +1166,49 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     }
     let mut info = skyward_info::collect(cfg)?;
     let fonts = Fonts::load(font, 0, mono)?;
-    let display_rotations: Vec<(u32, u16)> = cfg.touch.panels.iter().map(|panel| (panel.display_index, panel.display_rotation)).collect();
-    let surface = KmsSurface::open_with_panels("/dev/dri/card0", 0, &display_rotations)?;
-    let (mut w, mut h) = surface.size();
-    let mut active_panel = surface.panel_identity();
-    eprintln!("display {}", surface.describe());
-    let mut surface = Some(surface);
-    let mut reopen_display = None;
-    let mut reopen_at: Option<Instant> = None;
-    let mut reopen_attempts = 0u32;
-    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone(), cfg.touch.panels.clone())?;
+    // Display selection must be known before opening KMS heads.
+    let kept = settings::read()?;
+    let selected_mode = kept
+        .settings()
+        .map_or(DisplayMode::default(), |settings| settings.display_mode);
+    let display_rotations: Vec<(u32, u16)> = cfg
+        .touch
+        .panels
+        .iter()
+        .map(|panel| (panel.display_index, panel.display_rotation))
+        .collect();
+    let requested_primary_panel =
+        primary_panel_for_display_mode(selected_mode, &cfg.touch.panels).cloned();
+    let requested_primary_display_index = requested_primary_panel
+        .as_ref()
+        .map_or(0, |panel| panel.display_index);
+    // Try all configured panels first, but retain the requested panel as a
+    // single-head fallback when another connector cannot be opened.
+    let mut surface = KmsSurface::open_with_panels(
+        "/dev/dri/card0",
+        requested_primary_display_index,
+        &display_rotations,
+    )?;
+    let primary_display_index = surface.display_index();
+    let primary_panel = cfg
+        .touch
+        .panels
+        .iter()
+        .find(|panel| panel.display_index == primary_display_index)
+        .cloned();
+    let mut focused_display_index = primary_display_index;
+    let (w, h) = surface
+        .size_for_display(primary_display_index)
+        .ok_or_else(|| anyhow!("configured primary display {primary_display_index} did not open"))?;
+    let opened_panels: Vec<TouchPanel> = cfg
+        .touch
+        .panels
+        .iter()
+        .filter(|panel| surface.size_for_display(panel.display_index).is_some())
+        .cloned()
+        .collect();
+    eprintln!("displays {}", surface.describe());
+    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone(), opened_panels.clone())?;
     let started = Instant::now();
     let mut touch_known = false;
     // adbd and fastbootd ask over it to go over to fastboot and back.
@@ -1090,10 +1238,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // zone. The pages speak the language chosen then, or else the one the
     // system named with the work it asks for, or the one the installed
     // system is built to start in, or else the one they last spoke.
-    let kept = settings::read()?;
     let locale = request.locale.as_deref().or(info.locale.as_deref());
     let named = locale.map(Lang::for_locale).transpose()?;
     app.take_settings(kept.settings(), named);
+    app.state.display_mode_available = supports_display_modes(&opened_panels);
     let mut keeper = Keeper::new(&kept);
     skyward_sys::kmsg(&format!(
         "the pages speak {:?}, {}, and the locale named is {}",
@@ -1107,6 +1255,27 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         app.set_boot_slots(read_slots());
     }
     app.set_asked(asked(&request));
+    let mut display_views = Vec::new();
+    for panel in opened_panels
+        .iter()
+        .filter(|panel| panel.display_index != primary_display_index)
+    {
+        let (panel_w, panel_h) = surface
+            .size_for_display(panel.display_index)
+            .ok_or_else(|| anyhow!("configured display {} did not open", panel.display_index))?;
+        let mut view_app = App::new(first, panel_w, panel_h, cfg.display.density as f32 / 160.0);
+        view_app.set_screen_corners(cfg.display.corner_radius as f32);
+        view_app.take_settings(kept.settings(), named);
+        view_app.sync_shared_state_from(&app);
+        Canvas::keep_ready(panel_w, panel_h, 3);
+        display_views.push(SecondaryView {
+            panel: panel.clone(),
+            app: view_app,
+            screen: Canvas::new(panel_w, panel_h),
+            blanked: false,
+            rested_at: None,
+        });
+    }
     // Opening the data partition, or a user's own files in it, under way,
     // and the users whose own files are still closed once it is open.
     let mut decryptor: Option<Decryptor> = None;
@@ -1323,8 +1492,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // request says to.
     let leave = if request.shutdown_after { Target::PowerOff } else { Target::System };
     let mut leave_at: Option<u64> = None;
-    // The terminal page's shell, from when the page first asks for one.
-    let mut shell: Option<pty::Shell> = None;
+    // Each display's terminal page owns its own shell.
+    let mut shells = (0..=display_views.len())
+        .map(|_| None)
+        .collect::<Vec<Option<pty::Shell>>>();
     // Copying, moving or deleting under way.
     let mut worker: Option<filework::Worker> = None;
     // Giving the data partition's files their SELinux labels under way.
@@ -1380,38 +1551,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let mut drive_at = Instant::now();
     loop {
         let now = monotonic_ms();
-        if surface.is_none() && reopen_at.is_some_and(|at| Instant::now() >= at) {
-            let requested = reopen_display.unwrap_or(0);
-            match KmsSurface::open_with_panels("/dev/dri/card0", requested, &display_rotations) {
-                Ok(restored) => {
-                    let identity = restored.panel_identity();
-                    let size = restored.size();
-                    if identity != active_panel || size != (w, h) {
-                        active_panel = identity;
-                        (w, h) = size;
-                        inputs.set_size(w, h);
-                        app.resize(w, h);
-                        screen = Canvas::new(w, h);
-                        Canvas::keep_ready(w, h, 3);
-                        touch_known = false;
-                    }
-                    app.redraw();
-                    blanked = false;
-                    rested_at = None;
-                    eprintln!("reopened display {}", restored.describe());
-                    surface = Some(restored);
-                    reopen_display = None;
-                    reopen_at = None;
-                    reopen_attempts = 0;
-                }
-                Err(error) => {
-                    reopen_attempts = reopen_attempts.saturating_add(1);
-                    if reopen_attempts == 1 || reopen_attempts.is_power_of_two() {
-                        eprintln!("could not reopen a connected display: {error:#}; retrying");
-                    }
-                    reopen_at = Some(Instant::now() + Duration::from_millis(250));
-                }
-            }
+        for view in &mut display_views {
+            view.app.sync_shared_state_from(&app);
         }
         if leave_at.is_some_and(|at| now >= at) {
             leave_at = None;
@@ -1441,10 +1582,27 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 other => unreachable!("time passing asks for nothing but the motor, not {other:?}"),
             }
         }
+        for view in &mut display_views {
+            for fx in view.app.tick(now) {
+                match fx {
+                    Effect::Haptic => {
+                        if let Some(h) = &mut haptics {
+                            h.click(app.state.vibration)?;
+                        }
+                    }
+                    Effect::Ticks => {
+                        if let Some(h) = &mut haptics {
+                            h.ticks()?;
+                        }
+                    }
+                    other => unreachable!("time passing asks for nothing but the motor, not {other:?}"),
+                }
+            }
+        }
         let time = clock(app.state.time_zone)?;
         if time != shown_clock {
             shown_clock = time;
-            app.redraw();
+            redraw_display_views(&mut app, &mut display_views);
         }
         for reading in readings.taken() {
             match reading {
@@ -1456,7 +1614,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     if battery != info.battery {
                         plug(&mut app, &info.battery, &battery, now)?;
                         info.battery = battery;
-                        app.refresh();
+                        refresh_display_views(&mut app, &mut display_views);
                     }
                 }
                 Reading::All(all, at) => {
@@ -1467,7 +1625,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     if at >= read_at && all != info {
                         plug(&mut app, &info.battery, &all.battery, now)?;
                         info = all;
-                        app.refresh();
+                        refresh_display_views(&mut app, &mut display_views);
                     }
                 }
             }
@@ -1478,77 +1636,87 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             app.set_fastboot(running, link);
             port_at = Instant::now();
         }
-        let panel = if surface.is_some() { app.panel(now) } else { None };
-        let mut shown = false;
-        if let Some(surface) = surface.as_mut() {
-            if panel.is_some() {
-                // A display turned off comes on again with a frame drawn for it.
-                if app.take_dirty() || !surface.is_on() {
-                    let t0 = Instant::now();
-                    app.compose(&mut screen, &fonts, &info, &shown_clock, now);
-                    surface.present(&screen)?;
-                    eprintln!("frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
-                    if let Some(path) = dump {
-                        fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
-                    }
-                    shown = true;
-                }
-                blanked = false;
-            } else if !blanked {
-                // Black out the panel's frame memory before the backlight goes
-                // to 0 and the display off, so an OLED that floors the backlight
-                // above zero rather than cutting it shows nothing as it goes off.
-                screen.data.fill(0);
-                surface.present(&screen)?;
-                surface.settle()?;
-                blanked = true;
-            }
-            // After the frame is on the panel, so a panel coming back on lights
-            // with what it should show now, never with what it showed when it
-            // went off.
-            if backlight.level == 0 && panel.is_some() {
-                surface.settle()?;
-            }
-            if panel.is_some() {
-                // Lit, a panel that came on again switches to its fastest
-                // refresh.
-                surface.speed_up()?;
-                rested_at = None;
-            } else if surface.is_on() {
-                // With the backlight off, the panel rests, and the touch
-                // controller following it stops drawing power.
-                surface.rest()?;
-                rested_at = Some(Instant::now());
-            } else if rested_at.is_some_and(|at| at.elapsed() >= REST) {
-                // Rested long enough, the display goes off: the panel and the
-                // display processor feeding it stop drawing power.
-                surface.turn_off()?;
-                rested_at = None;
-            }
-            backlight.show(panel)?;
-        } else {
-            blanked = false;
-            rested_at = None;
-            backlight.show(None)?;
+        for view in &mut display_views {
+            view.app.sync_shared_state_from(&app);
         }
-        // A page at rest draws the rows it has yet to while nothing else
-        // is to be done, a band at a time, looking for input between bands.
-        let ahead = panel.is_some() && !shown && app.draw_ahead(&fonts, &info);
+        let mode = effective_display_mode(app.state.display_mode, &opened_panels);
+        let enabled_display_count = enabled_panel_count(mode, &opened_panels);
+        let idle_power_down_allowed = surface.idle_power_down_allowed(enabled_display_count);
+        let primary_enabled = primary_panel
+            .as_ref()
+            .is_none_or(|panel| mode.includes_role(panel.role));
+        let primary_display = primary_panel.as_ref().map_or(primary_display_index, |panel| panel.display_index);
+        let (primary_shown, primary_light) = render_panel_view(
+            &mut surface,
+            primary_display,
+            &mut app,
+            &mut screen,
+            primary_enabled,
+            idle_power_down_allowed,
+            &mut blanked,
+            &mut rested_at,
+            backlight.level == 0,
+            &fonts,
+            &info,
+            &shown_clock,
+            now,
+            dump,
+        )?;
+        let mut shown = primary_shown;
+        let mut backlight_level = primary_light;
+        for view in &mut display_views {
+            let enabled = mode.includes_role(view.panel.role);
+            let (view_shown, light) = render_panel_view(
+                &mut surface,
+                view.panel.display_index,
+                &mut view.app,
+                &mut view.screen,
+                enabled,
+                idle_power_down_allowed,
+                &mut view.blanked,
+                &mut view.rested_at,
+                backlight.level == 0,
+                &fonts,
+                &info,
+                &shown_clock,
+                now,
+                None,
+            )?;
+            shown |= view_shown;
+            if let Some(light) = light {
+                backlight_level = Some(backlight_level.map_or(light, |current| current.max(light)));
+            }
+        }
+        backlight.show(backlight_level)?;
+        // Each screen draws its own unfinished rows while the rest of the
+        // recovery remains responsive to input and worker events.
+        let mut ahead = primary_light.is_some() && !shown && app.draw_ahead(&fonts, &info);
+        for view in &mut display_views {
+            if !shown && mode.includes_role(view.panel.role) && view.app.panel(now).is_some() {
+                ahead |= view.app.draw_ahead(&fonts, &info);
+            }
+        }
         // A frame shown has waited for the one before it to reach the
         // panel, which keeps the loop to the panel's pace; otherwise the CPU
         // gets at least a millisecond.
         let floor = if shown { 0 } else { 1 };
-        let until_due = app.deadline(now).map(|d| d.saturating_sub(now) as i32);
+        let until_due = std::iter::once(app.deadline(now))
+            .chain(display_views.iter().map(|view| view.app.deadline(now)))
+            .flatten()
+            .map(|deadline| deadline.saturating_sub(now) as i32)
+            .min();
         // A resting panel turns off once its rest is over.
-        let rest_left = rested_at.map(|at| REST.saturating_sub(at.elapsed()).as_millis() as i32);
-        let retry_left = reopen_at.map(|at| at.saturating_duration_since(Instant::now()).as_millis() as i32);
+        let rest_left = std::iter::once(rested_at)
+            .chain(display_views.iter().map(|view| view.rested_at))
+            .flatten()
+            .map(|at| REST.saturating_sub(at.elapsed()).as_millis() as i32)
+            .min();
         let timeout = if ahead {
             0
         } else {
             until_due
                 .into_iter()
                 .chain(rest_left)
-                .chain(retry_left)
                 .min()
                 .map_or(1000, |t| t.clamp(floor, 1000))
         };
@@ -1572,12 +1740,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             || skyward_updater.is_some()
             || systems_busy;
         let joining = app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
-        let running = match &shell {
-            Some(sh) => !sh.waiting()?,
-            None => false,
-        };
-        let may_sleep = surface.as_ref().is_some_and(|surface| surface.is_off())
-            && reopen_at.is_none()
+        let mut running = false;
+        for sh in shells.iter().flatten() {
+            if !sh.waiting()? {
+                running = true;
+                break;
+            }
+        }
+        let may_sleep = surface.is_off()
             && !busy
             && !fastboot
             && !sideloading
@@ -1597,7 +1767,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if let Some(e) = &eraser {
             fds.push(e.fd());
         }
-        if let Some(sh) = &shell {
+        for sh in shells.iter().flatten() {
             fds.extend(sh.fds());
         }
         if let Some(w) = &worker {
@@ -1917,7 +2087,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 merger = None;
                 read_at = Instant::now();
                 info = skyward_info::collect(cfg)?;
-                app.refresh();
+                refresh_display_views(&mut app, &mut display_views);
             }
         }
         if let Some(w) = &mut systems_worker {
@@ -2137,19 +2307,22 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 }
             }
         }
-        if let Some(sh) = &mut shell {
-            let wrote = sh.read()?;
+        // Each shell writes only to the terminal page that started it.
+        for (shell_slot, shell) in shells.iter_mut().enumerate() {
+            let Some(sh) = shell.as_mut() else { continue };
+            let mut wrote = sh.read()?;
+            let ended = sh.ended()?.map(pty::how);
+            if ended.is_some() {
+                // What it wrote last shows before its end does.
+                wrote.extend(sh.read()?);
+            }
+            let app = app_for_shell_slot(&mut app, &mut display_views, shell_slot);
             if !wrote.is_empty() {
                 app.term_output(&wrote);
             }
-            if let Some(status) = sh.ended()? {
-                // What it wrote last shows before its end does.
-                let last = sh.read()?;
-                if !last.is_empty() {
-                    app.term_output(&last);
-                }
-                app.term_ended(pty::how(status));
-                shell = None;
+            if let Some(ended) = ended {
+                app.term_ended(ended);
+                *shell = None;
             }
         }
         // Then what programs asked on the recovery socket, each answered as
@@ -2165,6 +2338,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             .chain(requests.into_iter().map(Incoming::Asked))
             .chain(inputs.read()?.into_iter().map(Incoming::Input));
         for came in incoming {
+            let mut target_view = None;
             let effects = match came {
                 Incoming::Arrived => app.arrive(),
                 Incoming::Drive(drive) => app.set_usb_drive(drive),
@@ -2172,62 +2346,87 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
                     answer(asked, fastboot)
                 }
-                Incoming::Input(Event::Touch(t, at, target)) => {
-                    let mut belongs_to_active = target.is_none();
-                    if let Some(target) = target {
-                        if skyward_ui::touch::is_touch_start(t) {
-                            match surface.as_ref() {
-                                Some(active) if !active.is_dsi_display(target.display_index) => {
-                                    let Some(current) = surface.take() else {
-                                        unreachable!("an active display was observed before taking it")
-                                    };
-                                    match current.switch_to(target.display_index, &display_rotations) {
-                                        Ok((next, switched)) => {
-                                            if switched {
-                                                active_panel = next.panel_identity();
-                                                (w, h) = next.size();
-                                                inputs.set_size(w, h);
-                                                app.resize(w, h);
-                                                screen = Canvas::new(w, h);
-                                                Canvas::keep_ready(w, h, 3);
-                                                touch_known = false;
-                                                blanked = false;
-                                                rested_at = None;
-                                                eprintln!("switched display: {}", next.describe());
-                                            }
-                                            surface = Some(next);
-                                        }
-                                        Err(error) => {
-                                            eprintln!("display switch failed; keeping recovery services live: {error:#}");
-                                            reopen_display = Some(target.display_index);
-                                            reopen_at = Some(Instant::now());
-                                            reopen_attempts = 0;
-                                        }
-                                    }
-                                }
-                                None => {
-                                    reopen_display = Some(target.display_index);
-                                    reopen_at = Some(skyward_ui::surface::retain_retry_deadline(
-                                        reopen_at,
-                                        Instant::now(),
-                                    ));
-                                }
-                                _ => {}
-                            }
+                Incoming::Input(Event::Touch(t, at, target)) => match target {
+                    None if cfg.touch.panels.is_empty() => app.touch(t, &fonts, at),
+                    Some(target)
+                        if touch_panel_for_display(
+                            effective_display_mode(app.state.display_mode, &opened_panels),
+                            target.display_index,
+                            &cfg.touch.panels,
+                        )
+                        .is_some() =>
+                    {
+                        if let Some(view_index) = view_index_for_display(
+                            primary_display_index,
+                            display_views.iter().map(|view| view.panel.display_index),
+                            target.display_index,
+                        ) {
+                            focused_display_index = target.display_index;
+                            target_view = view_index;
+                            app_view_mut(&mut app, &mut display_views, view_index).touch(t, &fonts, at)
+                        } else {
+                            Vec::new()
                         }
-                        belongs_to_active = surface
-                            .as_ref()
-                            .is_some_and(|active| active.is_dsi_display(target.display_index));
                     }
-                    if belongs_to_active {
-                        app.touch(t, &fonts, at)
+                    _ => Vec::new(),
+                },
+                Incoming::Input(Event::Key(k, true)) => {
+                    let mode = effective_display_mode(app.state.display_mode, &opened_panels);
+                    let primary_enabled = primary_panel
+                        .as_ref()
+                        .is_none_or(|panel| mode.includes_role(panel.role));
+                    let view_index = if primary_enabled {
+                        None
                     } else {
-                        Vec::new()
+                        display_views
+                            .iter()
+                            .position(|view| {
+                                view.panel.display_index == focused_display_index && mode.includes_role(view.panel.role)
+                            })
+                            .or_else(|| display_views.iter().position(|view| mode.includes_role(view.panel.role)))
+                    };
+                    if primary_enabled {
+                        app.key(k, now)
+                    } else if let Some(view_index) = view_index {
+                        target_view = Some(view_index);
+                        app_view_mut(&mut app, &mut display_views, target_view).key(k, now)
+                    } else {
+                        app.key(k, now)
                     }
                 }
-                Incoming::Input(Event::Key(k, true)) => app.key(k, now),
-                Incoming::Input(Event::Key(k, false)) => app.key_up(k, now),
+                Incoming::Input(Event::Key(k, false)) => {
+                    let mode = effective_display_mode(app.state.display_mode, &opened_panels);
+                    let primary_enabled = primary_panel
+                        .as_ref()
+                        .is_none_or(|panel| mode.includes_role(panel.role));
+                    let view_index = if primary_enabled {
+                        None
+                    } else {
+                        display_views
+                            .iter()
+                            .position(|view| {
+                                view.panel.display_index == focused_display_index && mode.includes_role(view.panel.role)
+                            })
+                            .or_else(|| display_views.iter().position(|view| mode.includes_role(view.panel.role)))
+                    };
+                    if primary_enabled {
+                        app.key_up(k, now)
+                    } else if let Some(view_index) = view_index {
+                        target_view = Some(view_index);
+                        app_view_mut(&mut app, &mut display_views, target_view).key_up(k, now)
+                    } else {
+                        app.key_up(k, now)
+                    }
+                }
             };
+            let screenshot_canvas = effects
+                .iter()
+                .any(|fx| matches!(fx, Effect::Screenshot { .. }))
+                .then(|| target_view.map_or_else(|| screen.clone(), |index| display_views[index].screen.clone()));
+            let mut refresh_all_views = false;
+            let mut enter_recovery_all_views = false;
+            {
+                let mut app = app_view_mut(&mut app, &mut display_views, target_view);
             // What the pages ask for in answer to the work done goes on
             // after it.
             let mut queue = VecDeque::from(effects);
@@ -2283,11 +2482,20 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // A shell that will not start, or will not take keys,
                     // is the page's to report; the recovery carries on.
                     Effect::StartShell(folder) => {
-                        ensure!(shell.is_none(), "a shell runs already");
+                        let shell_slot = shell_slot_for_view(target_view);
+                        let shell = shells
+                            .get_mut(shell_slot)
+                            .context("no shell slot for this display")?;
+                        ensure!(shell.is_none(), "a shell runs already on this display");
                         let (rows, cols) = app.term_size(&fonts);
-                        match pty::Shell::start(rows, cols, &cfg.device.codename, Path::new(&folder)) {
+                        match pty::Shell::start(
+                            rows,
+                            cols,
+                            &cfg.device.codename,
+                            Path::new(&folder),
+                        ) {
                             Ok(sh) => {
-                                shell = Some(sh);
+                                *shell = Some(sh);
                                 app.term_started(rows, cols);
                             }
                             Err(e) => {
@@ -2297,13 +2505,19 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                     }
                     Effect::TermInput(bytes) => {
-                        let sh = shell.as_mut().context("keys went to a shell that has ended")?;
+                        let sh = shells
+                            .get_mut(shell_slot_for_view(target_view))
+                            .and_then(Option::as_mut)
+                            .context("keys went to a shell that has ended")?;
                         if let Err(e) = sh.write(&bytes) {
                             app.report(&format!("{e:#}"), now);
                         }
                     }
                     Effect::ShellTo(folder) => {
-                        let sh = shell.as_mut().context("a folder went to a shell that has ended")?;
+                        let sh = shells
+                            .get_mut(shell_slot_for_view(target_view))
+                            .and_then(Option::as_mut)
+                            .context("a folder went to a shell that has ended")?;
                         let went = match sh.waiting() {
                             Ok(true) => sh.change_to(&folder),
                             Ok(false) => {
@@ -2330,7 +2544,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // saved; one that cannot be is the page's to report.
                     Effect::Screenshot { storage } => {
                         let t0 = Instant::now();
-                        let saved = save_screenshot(&screen, storage, app.state.time_zone).map_err(|e| format!("{e:#}"));
+                        let frame = screenshot_canvas.as_ref().unwrap_or(&screen);
+                        let saved = save_screenshot(frame, storage, app.state.time_zone).map_err(|e| format!("{e:#}"));
                         eprintln!("screenshot {saved:?} in {} ms", t0.elapsed().as_millis());
                         app.screenshot_saved(saved, now);
                     }
@@ -2689,7 +2904,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         read_at = Instant::now();
                         info = skyward_info::collect(cfg)?;
                         fastboot = false;
-                        app.enter_recovery();
+                        enter_recovery_all_views = true;
+                        refresh_all_views = true;
                         if let Some(w) = systems_worker.as_mut() {
                             w.send(systems::Task::Resume);
                         }
@@ -2725,6 +2941,19 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                 }
             }
+            }
+            if enter_recovery_all_views {
+                skyward_ui::app::enter_recovery_views(&mut app, &mut display_views);
+            }
+            if refresh_all_views {
+                refresh_display_views(&mut app, &mut display_views);
+            }
+            if let Some(view_index) = target_view {
+                app.sync_shared_state_from(&display_views[view_index].app);
+            }
+            for view in &mut display_views {
+                view.app.sync_shared_state_from(&app);
+            }
         }
         // Internal storage goes to the computer while it is open, and no
         // erasing or installing could take it away. File transfer that does
@@ -2753,4 +2982,123 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             app.file_transfer_failed(false, &skyward_ui::fmt::transfer_stopped(app.state.lang, &format!("{why:#}")), now);
         }
     }
+}
+
+#[cfg(test)]
+mod display_mode_tests {
+    use super::*;
+    use skyward_config::{panels_for_display_mode, PanelRole};
+
+    fn ruyi() -> DeviceConfig {
+        DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap()
+    }
+
+    fn secondary_view() -> SecondaryView {
+        let panel = ruyi().touch.panels[1].clone();
+        SecondaryView {
+            panel,
+            app: App::new(Screen::Home, 10, 10, 1.0),
+            screen: Canvas::new(10, 10),
+            blanked: false,
+            rested_at: None,
+        }
+    }
+
+    #[test]
+    fn entering_recovery_from_a_secondary_view_resets_every_display() {
+        let mut primary = App::new(Screen::Fastboot, 10, 10, 1.0);
+        primary.set_fastboot(true, skyward_ui::app::UsbLink::Connected);
+        let mut secondary = secondary_view();
+        secondary.app = App::new(Screen::Fastboot, 10, 10, 1.0);
+        secondary
+            .app
+            .set_fastboot(true, skyward_ui::app::UsbLink::Connected);
+        let mut views = vec![secondary];
+
+        skyward_ui::app::enter_recovery_views(&mut primary, &mut views);
+
+        assert_eq!(
+            primary.screen(),
+            Screen::Home,
+            "primary must leave the stale fastboot page"
+        );
+        assert_eq!(views[0].app.screen(), Screen::Home);
+        assert!(!primary.state.fastboot.running);
+        assert!(!views[0].app.state.fastboot.running);
+    }
+
+    #[test]
+    fn shell_output_targets_the_display_that_started_it() {
+        assert_eq!(shell_slot_for_view(None), 0);
+        assert_eq!(shell_slot_for_view(Some(0)), 1);
+        assert_eq!(view_for_shell_slot(0), None);
+        assert_eq!(view_for_shell_slot(1), Some(0));
+
+        let mut primary = App::new(Screen::Home, 10, 10, 1.0);
+        let mut views = vec![secondary_view()];
+        let app = app_for_shell_slot(&mut primary, &mut views, shell_slot_for_view(Some(0)));
+        app.term_started(10, 20);
+        app.term_output(b"secondary shell output");
+        app.term_ended(skyward_ui::app::TermEnd::Exited(0));
+        assert_eq!(view_for_shell_slot(shell_slot_for_view(None)), None);
+    }
+
+    #[test]
+    fn clock_updates_redraw_every_display() {
+        let mut primary = App::new(Screen::Home, 10, 10, 1.0);
+        let mut views = vec![secondary_view()];
+        primary.take_dirty();
+        views[0].app.take_dirty();
+
+        redraw_display_views(&mut primary, &mut views);
+
+        assert!(primary.take_dirty());
+        assert!(views[0].app.take_dirty());
+    }
+
+    #[test]
+    fn device_info_updates_refresh_every_display() {
+        let mut primary = App::new(Screen::Home, 10, 10, 1.0);
+        let mut views = vec![secondary_view()];
+        primary.take_dirty();
+        views[0].app.take_dirty();
+
+        refresh_display_views(&mut primary, &mut views);
+
+        assert!(primary.take_dirty());
+        assert!(views[0].app.take_dirty());
+    }
+
+    #[test]
+    fn each_mode_selects_the_explicit_panel_roles() {
+        let config = ruyi();
+        let indices = |mode| {
+            panels_for_display_mode(mode, &config.touch.panels)
+                .iter()
+                .map(|panel| panel.display_index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(indices(DisplayMode::InternalOnly), [0]);
+        assert_eq!(indices(DisplayMode::ExternalOnly), [1]);
+        assert_eq!(indices(DisplayMode::Both), [0, 1]);
+    }
+
+    #[test]
+    fn touches_route_only_to_the_matching_enabled_panel() {
+        let config = ruyi();
+        let panels = &config.touch.panels;
+        assert_eq!(touch_panel_for_display(DisplayMode::Both, 0, panels).map(|panel| panel.role), Some(PanelRole::Internal));
+        assert_eq!(touch_panel_for_display(DisplayMode::Both, 1, panels).map(|panel| panel.role), Some(PanelRole::External));
+        assert_eq!(touch_panel_for_display(DisplayMode::InternalOnly, 1, panels), None);
+        assert_eq!(touch_panel_for_display(DisplayMode::ExternalOnly, 0, panels), None);
+        assert_eq!(touch_panel_for_display(DisplayMode::ExternalOnly, 1, panels).map(|panel| panel.role), Some(PanelRole::External));
+    }
+
+    #[test]
+    fn display_mode_settings_require_both_configured_roles() {
+        let config = ruyi();
+        assert!(supports_display_modes(&config.touch.panels));
+        assert!(!supports_display_modes(&[]));
+    }
+
 }

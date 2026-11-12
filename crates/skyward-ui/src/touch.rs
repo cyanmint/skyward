@@ -1,11 +1,5 @@
 //! Pure touch/display mapping shared by the Android input adapter and host tests.
 
-use crate::app::Touch;
-
-/// Whether a touch event begins a gesture and may request a panel switch.
-pub fn is_touch_start(touch: Touch) -> bool {
-    matches!(touch, Touch::Down(..))
-}
 
 /// Map a raw axis value into a display's pixel coordinates, clamping the
 /// inclusive input range to the inclusive pixel range. A descending range
@@ -48,12 +42,6 @@ pub fn display_for_device<'a>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn panel_switch_is_only_requested_at_the_start_of_a_touch() {
-        assert!(is_touch_start(Touch::Down(100.0, 100.0)));
-        assert!(!is_touch_start(Touch::Move(150.0, 150.0)));
-        assert!(!is_touch_start(Touch::Up));
-    }
 
     #[test]
     fn raw_touch_endpoints_land_on_display_pixels_not_outside_the_canvas() {

@@ -14,6 +14,7 @@ use crate::font::Fonts;
 use crate::geom::Rect;
 use crate::lang::{Lang, Text};
 use crate::search;
+use crate::settings::DisplayMode;
 use crate::term::{self, Term};
 use crate::theme::Theme;
 use crate::tr;
@@ -74,6 +75,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::About => about(cx),
         Screen::Specs => specs(cx),
         Screen::ScreenOff => screen_off(cx),
+        Screen::DisplayMode => display_mode(cx),
         Screen::Search => search(cx),
         Screen::Backup => backup(cx),
         Screen::Restore => restore(cx),
@@ -371,11 +373,21 @@ pub fn settings(cx: &Ctx) -> Frame {
         out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
     }
     y = widgets::section(&mut c, t, f, vibration.bottom, l.pick(["通用", "一般", "General"]));
-    let general = widgets::list(&mut c, t, f, y, &[
+    let mut general_rows = vec![
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
-    ]);
-    out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
+    ];
+    let mut general_actions = vec![Action::Open(Screen::Language), Action::Open(Screen::TimeZone)];
+    if s.display_mode_available {
+        general_rows.push(
+            Row::new(l.pick(["屏幕模式", "螢幕模式", "Display mode"]))
+                .icon(PURPLE, Icon::Phone)
+                .trail(Trail::Value(display_mode_name(l, s.display_mode))),
+        );
+        general_actions.push(Action::Open(Screen::DisplayMode));
+    }
+    let general = widgets::list(&mut c, t, f, y, &general_rows);
+    out.extend(hits(&general.rows, &general_actions));
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
     let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
     out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
@@ -443,6 +455,35 @@ pub fn screen_off(cx: &Ctx) -> Frame {
         widgets::footnote(&mut c, t, f, y, note);
     }
     Frame::new(t, c, hits(&times.rows, &picks), l.pick(SCREEN_TIMEOUT), top)
+}
+
+fn display_mode_name(l: Lang, mode: DisplayMode) -> &'static str {
+    match mode {
+        DisplayMode::InternalOnly => l.pick(["仅内屏", "僅內屏", "Inner display only"]),
+        DisplayMode::ExternalOnly => l.pick(["仅外屏", "僅外屏", "Cover display only"]),
+        DisplayMode::Both => l.pick(["内外屏独立显示", "內外屏獨立顯示", "Both displays independently"]),
+    }
+}
+
+/// Which built-in panel or panels show the recovery's pages.
+pub fn display_mode(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = page(cx);
+    let top = t.m.content_top;
+    let modes = [DisplayMode::ExternalOnly, DisplayMode::InternalOnly, DisplayMode::Both];
+    let rows: Vec<Row> = modes
+        .iter()
+        .map(|&mode| Row::new(display_mode_name(l, mode)).trail(Trail::Check(s.display_mode == mode)))
+        .collect();
+    let list = widgets::list(&mut c, t, f, top, &rows);
+    let actions: Vec<Action> = modes.into_iter().map(Action::DisplayMode).collect();
+    let note = l.pick([
+        "双屏模式下，两块屏幕各自显示独立页面，触摸只作用于对应屏幕，不会镜像。",
+        "雙屏模式下，兩塊螢幕各自顯示獨立頁面，觸控只作用於對應螢幕，不會鏡像。",
+        "With both displays on, each has its own pages and touch input; they are not mirrored.",
+    ]);
+    let bottom = widgets::footnote(&mut c, t, f, list.bottom, note);
+    Frame::new(t, fit(c, t, bottom), hits(&list.rows, &actions), l.pick(["屏幕模式", "螢幕模式", "Display mode"]), top)
 }
 
 /// Mount manager: the slot's partitions, each with a switch to mount it

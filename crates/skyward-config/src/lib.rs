@@ -1,5 +1,5 @@
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -308,12 +308,66 @@ impl Default for Modules {
     }
 }
 
+/// The foldable panel a configured touchscreen belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelRole {
+    /// The large, inward-facing display.
+    #[default]
+    Internal,
+    /// The cover display.
+    External,
+}
+
+/// Which configured panels show the recovery's pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayMode {
+    InternalOnly,
+    ExternalOnly,
+    Both,
+}
+
+impl Default for DisplayMode {
+    fn default() -> Self {
+        Self::Both
+    }
+}
+
+impl<'de> Deserialize<'de> for DisplayMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "internal_only" => Self::InternalOnly,
+            "external_only" => Self::ExternalOnly,
+            "both" => Self::Both,
+            _ => Self::Both,
+        })
+    }
+}
+
+impl DisplayMode {
+    pub const fn includes_role(self, role: PanelRole) -> bool {
+        match self {
+            Self::InternalOnly => matches!(role, PanelRole::Internal),
+            Self::ExternalOnly => matches!(role, PanelRole::External),
+            Self::Both => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TouchPanel {
     /// Name reported by evdev for this touchscreen.
     pub device: String,
     /// Display index used by the panel's DRM connector and UI layout.
     pub display_index: u32,
+    /// Whether this touchscreen belongs to the inner or cover panel.
+    #[serde(default)]
+    pub role: PanelRole,
     /// Preferred mode dimensions on that display.
     pub width: u32,
     pub height: u32,
@@ -323,6 +377,69 @@ pub struct TouchPanel {
     /// Rotation applied to raw touch coordinates, independent of scanout.
     #[serde(default)]
     pub touch_rotation: u16,
+}
+
+/// Panels the selected mode enables, in device-configuration order.
+pub fn panels_for_display_mode<'a>(
+    mode: DisplayMode,
+    panels: &'a [TouchPanel],
+) -> Vec<&'a TouchPanel> {
+    panels
+        .iter()
+        .filter(|panel| mode.includes_role(panel.role))
+        .collect()
+}
+
+/// How many of the open panels remain active in this display mode.
+pub fn enabled_panel_count(mode: DisplayMode, panels: &[TouchPanel]) -> usize {
+    panels
+        .iter()
+        .filter(|panel| mode.includes_role(panel.role))
+        .count()
+}
+
+/// The panel to open first for this mode, preferring the inner panel for
+/// both displays and falling back to the first configured panel.
+pub fn primary_panel_for_display_mode<'a>(
+    mode: DisplayMode,
+    panels: &'a [TouchPanel],
+) -> Option<&'a TouchPanel> {
+    let preferred_role = match mode {
+        DisplayMode::ExternalOnly => PanelRole::External,
+        DisplayMode::InternalOnly | DisplayMode::Both => PanelRole::Internal,
+    };
+    panels
+        .iter()
+        .find(|panel| panel.role == preferred_role)
+        .or_else(|| panels.first())
+}
+
+/// The configured touchscreen for a display, unless that display is disabled.
+pub fn touch_panel_for_display<'a>(
+    mode: DisplayMode,
+    display_index: u32,
+    panels: &'a [TouchPanel],
+) -> Option<&'a TouchPanel> {
+    panels.iter().find(|panel| {
+        panel.display_index == display_index && mode.includes_role(panel.role)
+    })
+}
+
+/// Whether the settings page can offer all three display-mode choices.
+pub fn supports_display_modes(panels: &[TouchPanel]) -> bool {
+    let internal = panels.iter().find(|panel| panel.role == PanelRole::Internal);
+    let external = panels.iter().find(|panel| panel.role == PanelRole::External);
+    matches!((internal, external), (Some(inner), Some(outer)) if inner.display_index != outer.display_index)
+}
+
+/// The mode to apply to opened panels. A saved single-panel choice must not
+/// blank the only panel that opened after a connector failure.
+pub fn effective_display_mode(requested: DisplayMode, opened_panels: &[TouchPanel]) -> DisplayMode {
+    if supports_display_modes(opened_panels) {
+        requested
+    } else {
+        DisplayMode::Both
+    }
 }
 
 /// The touchscreen, on phones whose touch controller is to be told
@@ -740,12 +857,105 @@ mod tests {
         assert_eq!(config.touch.panels.len(), 2);
         assert_eq!(
             config.touch.panels[0],
-            TouchPanel { device: "synaptics_tcm_touch".into(), display_index: 0, width: 1224, height: 2912, display_rotation: 0, touch_rotation: 0 }
+            TouchPanel { device: "synaptics_tcm_touch".into(), display_index: 0, role: PanelRole::Internal, width: 1224, height: 2912, display_rotation: 0, touch_rotation: 0 }
         );
         assert_eq!(
             config.touch.panels[1],
-            TouchPanel { device: "goodix_ts".into(), display_index: 1, width: 1208, height: 1392, display_rotation: 180, touch_rotation: 180 }
+            TouchPanel { device: "goodix_ts".into(), display_index: 1, role: PanelRole::External, width: 1208, height: 1392, display_rotation: 180, touch_rotation: 180 }
         );
+    }
+
+    #[test]
+    fn display_modes_select_only_their_configured_panels() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let indices = |mode| {
+            panels_for_display_mode(mode, &config.touch.panels)
+                .iter()
+                .map(|panel| panel.display_index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(indices(DisplayMode::InternalOnly), [0]);
+        assert_eq!(indices(DisplayMode::ExternalOnly), [1]);
+        assert_eq!(indices(DisplayMode::Both), [0, 1]);
+    }
+
+    #[test]
+    fn enabled_panel_count_tracks_the_selected_mode() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let panels = &config.touch.panels;
+        assert_eq!(enabled_panel_count(DisplayMode::InternalOnly, panels), 1);
+        assert_eq!(enabled_panel_count(DisplayMode::ExternalOnly, panels), 1);
+        assert_eq!(enabled_panel_count(DisplayMode::Both, panels), 2);
+    }
+
+    #[test]
+    fn primary_panel_follows_the_selected_display_mode() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let primary = |mode| {
+            primary_panel_for_display_mode(mode, &config.touch.panels)
+                .map(|panel| panel.display_index)
+        };
+        assert_eq!(primary(DisplayMode::InternalOnly), Some(0));
+        assert_eq!(primary(DisplayMode::ExternalOnly), Some(1));
+        assert_eq!(primary(DisplayMode::Both), Some(0));
+    }
+
+    #[test]
+    fn touch_routes_only_to_a_panel_enabled_by_the_selected_mode() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let panels = &config.touch.panels;
+        assert_eq!(touch_panel_for_display(DisplayMode::Both, 0, panels).map(|panel| panel.role), Some(PanelRole::Internal));
+        assert_eq!(touch_panel_for_display(DisplayMode::Both, 1, panels).map(|panel| panel.role), Some(PanelRole::External));
+        assert_eq!(touch_panel_for_display(DisplayMode::InternalOnly, 1, panels), None);
+        assert_eq!(touch_panel_for_display(DisplayMode::ExternalOnly, 0, panels), None);
+        assert_eq!(touch_panel_for_display(DisplayMode::ExternalOnly, 1, panels).map(|panel| panel.role), Some(PanelRole::External));
+    }
+
+    #[test]
+    fn display_mode_choices_require_both_configured_roles() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        assert!(supports_display_modes(&config.touch.panels));
+        assert!(!supports_display_modes(&[]));
+    }
+
+    #[test]
+    fn a_single_available_panel_stays_enabled_for_every_saved_mode() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        for available in &config.touch.panels {
+            let opened = [available.clone()];
+            for requested in [DisplayMode::InternalOnly, DisplayMode::ExternalOnly, DisplayMode::Both] {
+                let active = effective_display_mode(requested, &opened);
+                assert_eq!(active, DisplayMode::Both, "saved {requested:?}, available {:?}", available.role);
+                assert!(active.includes_role(available.role));
+                assert!(touch_panel_for_display(active, available.display_index, &opened).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn active_mode_preserves_the_saved_choice_when_both_roles_are_open() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        for requested in [DisplayMode::InternalOnly, DisplayMode::ExternalOnly, DisplayMode::Both] {
+            assert_eq!(effective_display_mode(requested, &config.touch.panels), requested);
+        }
+    }
+
+    #[test]
+    fn legacy_touch_panel_config_defaults_to_internal_role() {
+        let config = DeviceConfig::parse(
+            "[device]\ncodename = \"x\"\n[[touch.panels]]\ndevice = \"panel\"\ndisplay_index = 0\nwidth = 100\nheight = 200\n",
+        )
+        .unwrap();
+        assert_eq!(config.touch.panels[0].role, PanelRole::Internal);
+    }
+
+    #[test]
+    fn ruyi_names_its_inner_and_outer_panels_explicitly() {
+        let config: toml::Value = toml::from_str(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let panels = config["touch"]["panels"].as_array().unwrap();
+        let role = |index: usize| panels.get(index).and_then(|panel| panel.get("role")).and_then(toml::Value::as_str);
+        assert_eq!(role(0), Some("internal"));
+        assert_eq!(role(1), Some("external"));
     }
 
     #[test]

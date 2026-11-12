@@ -314,11 +314,6 @@ impl Inputs {
         !self.panels.is_empty()
     }
 
-    /// The current display size used by unconfigured single-panel devices.
-    pub fn set_size(&mut self, w: u32, h: u32) {
-        self.w = w as f32;
-        self.h = h as f32;
-    }
 
     /// Readable while a device has something queued, or /dev/input changed.
     pub fn fd(&self) -> RawFd {

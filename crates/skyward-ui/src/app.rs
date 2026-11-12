@@ -14,7 +14,7 @@ use crate::motion::{self, Spring};
 use crate::pages::{self, Band, Ctx};
 use crate::sprite::{Blurs, Sprite};
 use crate::search;
-use crate::settings::Settings;
+use crate::settings::{DisplayMode, Settings};
 use crate::term::{self, Term, TermKey};
 use crate::theme::Theme;
 use crate::tr;
@@ -50,6 +50,8 @@ pub enum Screen {
     Specs,
     /// How long the screen stays on with nothing touched.
     ScreenOff,
+    /// Which built-in panels show the pages.
+    DisplayMode,
     /// Finding a feature or partition by name, typed on the screen's own
     /// keyboard.
     Search,
@@ -1199,6 +1201,8 @@ pub enum Action {
     Dismiss,
     /// Keep the screen on for this choice in [`SCREEN_OFF`].
     ScreenOff(usize),
+    /// Choose which built-in panels show the pages.
+    DisplayMode(DisplayMode),
     /// Keep the time zone at this place in [`TIME_ZONES`].
     TimeZone(usize),
     /// Speak this language.
@@ -1585,6 +1589,10 @@ pub struct State {
     /// How long the screen stays on with nothing touched, by its place in
     /// [`SCREEN_OFF`].
     pub screen_off: usize,
+    /// Which built-in panels show the recovery's pages.
+    pub display_mode: DisplayMode,
+    /// Whether this device has both an inner and a cover display.
+    pub display_mode_available: bool,
     /// The time zone the clock and the times on the pages keep, by its
     /// place in [`TIME_ZONES`].
     pub time_zone: usize,
@@ -1761,6 +1769,8 @@ impl Default for State {
             brightness: SLIDER_START,
             // Two minutes.
             screen_off: 3,
+            display_mode: DisplayMode::Both,
+            display_mode_available: false,
             time_zone: 0,
             vibrate: true,
             vibration: SLIDER_START,
@@ -2730,6 +2740,47 @@ pub struct App {
     px_per_dp: f32,
 }
 
+/// The page state owned by one display view.
+pub trait AppView {
+    fn app_mut(&mut self) -> &mut App;
+}
+
+impl AppView for App {
+    fn app_mut(&mut self) -> &mut App {
+        self
+    }
+}
+
+/// Start every independent display view in the recovery home after fastboot
+/// stops, so no panel keeps a stale fastboot page or status.
+pub fn enter_recovery_views<V: AppView>(primary: &mut App, views: &mut [V]) {
+    primary.enter_recovery();
+    for view in views {
+        view.app_mut().enter_recovery();
+    }
+}
+
+/// Select the primary app or one independently maintained display view.
+pub fn app_view_mut<'a, V: AppView>(primary: &'a mut App, views: &'a mut [V], index: Option<usize>) -> &'a mut App {
+    match index {
+        Some(index) => views[index].app_mut(),
+        None => primary,
+    }
+}
+
+/// Resolve a display to its own app: `Some(None)` is primary, `Some(Some(i))` is a secondary view.
+pub fn view_index_for_display(
+    primary_display_index: u32,
+    mut secondary_display_indices: impl Iterator<Item = u32>,
+    target_display_index: u32,
+) -> Option<Option<usize>> {
+    if target_display_index == primary_display_index {
+        Some(None)
+    } else {
+        secondary_display_indices.position(|index| index == target_display_index).map(Some)
+    }
+}
+
 impl App {
     pub fn new(start: Screen, w: u32, h: u32, px_per_dp: f32) -> Self {
         App {
@@ -3263,6 +3314,76 @@ impl App {
         self.dirty = true;
     }
 
+    /// Publish shared state and durable preferences to another display view
+    /// while preserving that view's page-specific choices and drafts.
+    pub fn sync_shared_state_from(&mut self, source: &Self) -> bool {
+        let mut changed = false;
+        macro_rules! copy_shared {
+            ($field:ident) => {
+                if self.state.$field != source.state.$field {
+                    self.state.$field = source.state.$field.clone();
+                    changed = true;
+                }
+            };
+        }
+        copy_shared!(lang);
+        copy_shared!(language_chosen);
+        copy_shared!(dark);
+        copy_shared!(brightness);
+        copy_shared!(screen_off);
+        copy_shared!(display_mode);
+        copy_shared!(display_mode_available);
+        copy_shared!(time_zone);
+        copy_shared!(vibrate);
+        copy_shared!(vibration);
+        copy_shared!(file_transfer);
+        copy_shared!(cache_partition);
+        copy_shared!(phone_logs);
+        copy_shared!(backup);
+        copy_shared!(backup_to);
+        copy_shared!(compress);
+        copy_shared!(verify);
+        copy_shared!(logs);
+        copy_shared!(logs_to);
+        copy_shared!(install);
+        copy_shared!(script_output);
+        copy_shared!(check_signature);
+        copy_shared!(recovery_partitions);
+        copy_shared!(keep_recovery);
+        copy_shared!(reflash);
+        copy_shared!(mounts);
+        copy_shared!(mount_failure);
+        copy_shared!(backups);
+        copy_shared!(backup_job);
+        copy_shared!(boot_slots);
+        copy_shared!(dual_boot);
+        copy_shared!(systems);
+        copy_shared!(systems_work);
+        copy_shared!(system_notice);
+        copy_shared!(data);
+        copy_shared!(usb_drive);
+        copy_shared!(fastboot);
+        copy_shared!(erase);
+        copy_shared!(asked);
+        copy_shared!(job);
+        copy_shared!(relabel);
+        copy_shared!(filesystems);
+        copy_shared!(part_work);
+        copy_shared!(update);
+        copy_shared!(wlan);
+        copy_shared!(update_server);
+        copy_shared!(check);
+        copy_shared!(have);
+        copy_shared!(download);
+        copy_shared!(skyward_check);
+        copy_shared!(skyward_job);
+        copy_shared!(traffic);
+        if changed {
+            self.refresh();
+        }
+        changed
+    }
+
     /// The active panel changed; keep application state and navigation, but
     /// discard geometry-dependent render state before drawing the new size.
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -3367,6 +3488,7 @@ impl App {
     /// Fastboot has stopped and the recovery is up: its pages start again
     /// from the home page, which nothing can go back from to fastboot.
     pub fn enter_recovery(&mut self) {
+        self.state.fastboot.running = false;
         self.stack = vec![(Screen::Home, 0.0, Focus::Unset)];
         self.settle_page();
         self.refresh();
@@ -5394,6 +5516,12 @@ impl App {
             Action::ScreenOff(k) => {
                 self.state.screen_off = k;
                 self.refresh();
+            }
+            Action::DisplayMode(mode) => {
+                if self.state.display_mode != mode {
+                    self.state.display_mode = mode;
+                    self.refresh();
+                }
             }
             Action::TimeZone(k) => {
                 self.state.time_zone = k;
@@ -8734,9 +8862,11 @@ mod tests {
     fn the_recovery_comes_up_from_fastboot_at_the_home_page() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Fastboot, W, H, PPD);
+        app.set_fastboot(true, UsbLink::Connected);
         app.frame(&f, &i);
         app.enter_recovery();
         assert_eq!(app.screen(), Screen::Home);
+        assert!(!app.state.fastboot.running, "recovery is no longer in fastboot");
         app.key(Key::Back, 0);
         assert_eq!(app.screen(), Screen::Home, "fastboot is not behind it");
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Search))), "the keys go on working the pages");
@@ -8744,6 +8874,25 @@ mod tests {
         app.touch(Touch::Up, &f, 0);
         assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Ticks]);
         assert!(!app.display_on(), "with the light put out, power turns the panel off");
+    }
+
+    #[test]
+    fn entering_recovery_from_a_secondary_view_resets_every_view() {
+        let mut primary = App::new(Screen::Fastboot, W, H, PPD);
+        let mut secondary = App::new(Screen::Fastboot, W, H, PPD);
+        primary.set_fastboot(true, UsbLink::Connected);
+        secondary.set_fastboot(true, UsbLink::Connected);
+
+        enter_recovery_views(&mut primary, std::slice::from_mut(&mut secondary));
+
+        assert_eq!(
+            primary.screen(),
+            Screen::Home,
+            "primary must leave the stale fastboot page"
+        );
+        assert_eq!(secondary.screen(), Screen::Home);
+        assert!(!primary.state.fastboot.running);
+        assert!(!secondary.state.fastboot.running);
     }
 
     #[test]
@@ -11331,6 +11480,108 @@ mod tests {
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("截图保存失败：No space left on device"));
         app.screenshots_not_kept("Read-only file system", 0);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("暂存的截图未能存入相册：Read-only file system"));
+    }
+
+    #[test]
+    fn actions_update_only_the_targeted_views_navigation_stack() {
+        let (f, i) = (fonts(), info());
+        let mut primary = App::new(Screen::Home, W, H, PPD);
+        let mut external = App::new(Screen::Settings, 1208, 1392, PPD);
+        external.state.display_mode_available = true;
+
+        let target = app_view_mut(&mut primary, std::slice::from_mut(&mut external), Some(0));
+        tap(target, &f, &i, Action::Open(Screen::DisplayMode));
+
+        assert_eq!(primary.screen(), Screen::Home);
+        assert_eq!(external.screen(), Screen::DisplayMode);
+    }
+
+    #[test]
+    fn separate_display_views_render_to_distinct_buffers() {
+        let (f, i) = (fonts(), info());
+        let mut primary = App::new(Screen::Home, W, H, PPD);
+        let mut external = App::new(Screen::Settings, W, H, PPD);
+        external.state.display_mode_available = true;
+
+        let target = app_view_mut(&mut primary, std::slice::from_mut(&mut external), Some(0));
+        tap(target, &f, &i, Action::Open(Screen::DisplayMode));
+
+        let mut primary_canvas = Canvas::new(W, H);
+        let mut external_canvas = Canvas::new(W, H);
+        primary.compose(&mut primary_canvas, &f, &i, "00:00", 0);
+        external.compose(&mut external_canvas, &f, &i, "00:00", 0);
+        assert_ne!(primary_canvas.data, external_canvas.data);
+    }
+
+    #[test]
+    fn each_display_resolves_to_its_own_app_view() {
+        assert_eq!(view_index_for_display(0, [0, 1].into_iter(), 0), Some(None));
+        assert_eq!(view_index_for_display(0, [1].into_iter(), 1), Some(Some(0)));
+        assert_eq!(view_index_for_display(0, [1].into_iter(), 2), None);
+    }
+
+    #[test]
+    fn display_mode_choices_are_saved_from_the_settings_page() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.display_mode_available = true;
+        tap(&mut app, &f, &i, Action::Open(Screen::Settings));
+        tap(&mut app, &f, &i, Action::Open(Screen::DisplayMode));
+        assert_eq!(app.screen(), Screen::DisplayMode);
+        tap(&mut app, &f, &i, Action::DisplayMode(DisplayMode::ExternalOnly));
+        assert_eq!(app.state.display_mode, DisplayMode::ExternalOnly);
+        assert_eq!(app.settings().display_mode, DisplayMode::ExternalOnly);
+    }
+
+    #[test]
+    fn a_single_panel_hides_display_mode_settings() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        tap(&mut app, &f, &i, Action::Open(Screen::Settings));
+        let frame = app.frame(&f, &i);
+        assert!(!frame.hits.iter().any(|hit| hit.action == Action::Open(Screen::DisplayMode)));
+    }
+
+    #[test]
+    fn separate_display_views_share_device_state_without_sharing_local_drafts() {
+        let mut inner = App::new(Screen::Home, W, H, PPD);
+        let mut outer = App::new(Screen::Settings, 1208, 1392, PPD);
+        inner.state.display_mode = DisplayMode::ExternalOnly;
+        inner.state.dark = true;
+        inner.state.code = "inner draft".into();
+        outer.state.code = "outer draft".into();
+
+        assert!(outer.sync_shared_state_from(&inner));
+        assert_eq!(outer.screen(), Screen::Settings);
+        assert_eq!(outer.state.display_mode, DisplayMode::ExternalOnly);
+        assert!(outer.state.dark);
+        assert_eq!(outer.state.code, "outer draft");
+        assert!(!outer.sync_shared_state_from(&inner), "unchanged shared state does not invalidate the view");
+    }
+
+    #[test]
+    fn secondary_view_persisted_preferences_sync_to_primary_and_settings() {
+        let mut primary = App::new(Screen::Home, W, H, PPD);
+        let mut secondary = App::new(Screen::Settings, W, H, PPD);
+        secondary.state.backup = [true, false, true, false];
+        secondary.state.backup_to = Place::UsbDrive;
+        secondary.state.compress = true;
+        secondary.state.verify = false;
+        secondary.state.logs = [true, false];
+        secondary.state.logs_to = 1;
+
+        assert!(primary.sync_shared_state_from(&secondary));
+        assert_eq!(primary.settings(), secondary.settings());
+
+        let serialized = primary.settings().text();
+        assert_eq!(Settings::read(&serialized).unwrap(), secondary.settings());
+
+        let mut keeper = crate::settings::Keeper::new(&crate::settings::Kept::Nothing);
+        assert_eq!(keeper.due(primary.settings(), 0), None);
+        assert_eq!(
+            keeper.due(primary.settings(), crate::settings::WAIT_MS),
+            Some(secondary.settings())
+        );
     }
 
     /// With the default two minutes, when the panel dims and when it goes

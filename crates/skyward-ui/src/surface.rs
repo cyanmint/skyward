@@ -45,7 +45,7 @@ fn preflight_switch<T>(
     }
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(test)]
 fn select_dsi_connector(connected_ids: &[u32], requested_display: u32) -> Option<u32> {
     requested_dsi_connector(connected_ids, requested_display)
         .or_else(|| connected_ids.iter().copied().min())
@@ -241,12 +241,42 @@ fn crtcs_to_disable(assignments: &[(u32, u32)], changed_connectors: &[u32], targ
     disabled
 }
 
-/// Keep both scanouts and touch controllers live in multi-head mode. Until
-/// wake-on-touch from suspend is verified on-device, do not suspend while
-/// either panel must remain touchable.
+/// Keep enabled scanouts and their touch controllers live in multi-head mode.
+/// Until wake-on-touch from suspend is verified on-device, do not suspend
+/// while more than one enabled panel must remain touchable.
 #[cfg(any(target_os = "android", test))]
-fn can_power_down_heads(head_count: usize) -> bool {
-    head_count <= 1
+fn can_power_down_heads(enabled_head_count: usize) -> bool {
+    enabled_head_count <= 1
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelPowerAction {
+    Keep,
+    Rest,
+    Off,
+    Active,
+}
+
+pub fn panel_power_action(
+    enabled: bool,
+    content_active: bool,
+    idle_power_down_allowed: bool,
+    display_is_on: bool,
+    rest_expired: bool,
+) -> PanelPowerAction {
+    if !enabled {
+        PanelPowerAction::Off
+    } else if content_active {
+        PanelPowerAction::Active
+    } else if !idle_power_down_allowed {
+        PanelPowerAction::Keep
+    } else if display_is_on {
+        PanelPowerAction::Rest
+    } else if rest_expired {
+        PanelPowerAction::Off
+    } else {
+        PanelPowerAction::Keep
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -257,7 +287,7 @@ fn rotation_for_display(display_index: u32, panels: &[(u32, u16)]) -> u16 {
         .unwrap_or(0)
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(test)]
 fn scanout_source_pixel(x: u32, y: u32, width: u32, height: u32, rotation: u16) -> (u32, u32) {
     if rotation == 180 {
         (width - 1 - x, height - 1 - y)
@@ -612,9 +642,29 @@ mod tests {
     }
 
     #[test]
-    fn multi_head_mode_keeps_touch_heads_out_of_idle_powerdown() {
+    fn idle_power_down_uses_enabled_head_count_not_open_head_count() {
         assert!(can_power_down_heads(1));
         assert!(!can_power_down_heads(2));
+    }
+
+    #[test]
+    fn idle_dual_displays_keep_each_touch_target_live() {
+        assert_eq!(
+            panel_power_action(true, false, false, true, false),
+            PanelPowerAction::Keep,
+            "an enabled idle head remains available to its touchscreen"
+        );
+        assert_eq!(
+            panel_power_action(false, false, false, true, false),
+            PanelPowerAction::Off,
+            "a mode-disabled head is not a touch target"
+        );
+        assert_eq!(
+            panel_power_action(true, false, true, true, false),
+            PanelPowerAction::Rest,
+            "single-panel idle behavior is preserved"
+        );
+        assert_eq!(panel_power_action(true, false, true, false, true), PanelPowerAction::Off);
     }
 
     #[test]
@@ -1096,6 +1146,52 @@ pub mod kms {
             } else {
                 vec![Self::open_head(std::sync::Arc::clone(&card), requested_display, panel_rotations, None)?]
             };
+            Self::finish_open(path, card, heads, requested_display)
+        }
+
+        /// Open every configured DSI panel or fail; unlike the legacy opener,
+        /// this never silently turns a requested dual-panel mode into one head.
+        pub fn open_exact_with_panels(path: &str, requested_display: u32, panel_rotations: &[(u32, u16)]) -> Result<Self> {
+            let displays: Vec<u32> = panel_rotations.iter().map(|(display, _)| *display).collect();
+            anyhow::ensure!(!displays.is_empty(), "no configured panels to open exactly");
+            anyhow::ensure!(displays.contains(&requested_display), "requested display {requested_display} is not configured");
+            let mut unique = displays.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            anyhow::ensure!(unique.len() == displays.len(), "a display is configured more than once");
+
+            let card = std::sync::Arc::new(open_card(path)?);
+            let mut heads = if displays.len() > 1 {
+                Self::open_dual_heads(&card, &displays, panel_rotations, requested_display)?
+            } else {
+                let display = displays[0];
+                let interface_id = display.checked_add(1).ok_or_else(|| anyhow!("display index overflow"))?;
+                let resources = card.resource_handles().context("read KMS resources")?;
+                let mut found = None;
+                for &handle in resources.connectors() {
+                    let info = card.get_connector(handle, true).context("read configured panel connector")?;
+                    if info.interface() == connector::Interface::DSI
+                        && info.interface_id() == interface_id
+                        && info.state() == connector::State::Connected
+                    {
+                        found = Some(info);
+                        break;
+                    }
+                }
+                let connector = found.ok_or_else(|| anyhow!("configured display {display} is not connected"))?;
+                vec![Self::open_configured_head(
+                    std::sync::Arc::clone(&card), &connector, panel_rotations, None, true,
+                )?]
+            };
+
+            let mut actual: Vec<u32> = heads.iter().map(|head| head.display_index).collect();
+            actual.sort_unstable();
+            anyhow::ensure!(actual == unique, "opened displays {actual:?}, expected {unique:?}");
+            heads.sort_by_key(|head| unique.iter().position(|display| *display == head.display_index).unwrap_or(usize::MAX));
+            Self::finish_open(path, card, heads, requested_display)
+        }
+
+        fn finish_open(path: &str, card: std::sync::Arc<Card>, heads: Vec<KmsHead>, requested_display: u32) -> Result<Self> {
             let display_indices: Vec<u32> = heads.iter().map(|head| head.display_index).collect();
             let mut surface = Self { card, path: path.to_owned(), heads, selected: 0 };
             for selected in 0..surface.heads.len() {
@@ -1550,6 +1646,68 @@ pub mod kms {
             )
         }
 
+        fn with_display<T>(
+            &mut self,
+            display_index: u32,
+            operation: impl FnOnce(&mut Self) -> Result<T>,
+        ) -> Result<T> {
+            let index = self
+                .heads
+                .iter()
+                .position(|head| head.display_index == display_index)
+                .ok_or_else(|| anyhow!("display {display_index} is not open"))?;
+            let previous = self.selected;
+            self.selected = index;
+            let result = operation(self);
+            self.selected = previous;
+            result
+        }
+
+        pub fn size_for_display(&self, display_index: u32) -> Option<(u32, u32)> {
+            self.heads
+                .iter()
+                .find(|head| head.display_index == display_index)
+                .map(|head| (head.w, head.h))
+        }
+
+        pub fn is_on_display(&self, display_index: u32) -> bool {
+            self.heads
+                .iter()
+                .find(|head| head.display_index == display_index)
+                .is_some_and(|head| head.power == Power::On)
+        }
+
+        pub fn is_off_display(&self, display_index: u32) -> bool {
+            self.heads
+                .iter()
+                .find(|head| head.display_index == display_index)
+                .is_some_and(|head| head.power == Power::Off)
+        }
+
+        pub fn idle_power_down_allowed(&self, enabled_head_count: usize) -> bool {
+            super::can_power_down_heads(enabled_head_count)
+        }
+
+        pub fn present_on(&mut self, display_index: u32, canvas: &Canvas) -> Result<()> {
+            self.with_display(display_index, |surface| Surface::present(surface, canvas))
+        }
+
+        pub fn settle_on(&mut self, display_index: u32) -> Result<()> {
+            self.with_display(display_index, Surface::settle)
+        }
+
+        pub fn speed_up_on(&mut self, display_index: u32) -> Result<()> {
+            self.with_display(display_index, |surface| surface.speed_up())
+        }
+
+        pub fn rest_on(&mut self, display_index: u32) -> Result<()> {
+            self.with_display(display_index, |surface| surface.rest_selected())
+        }
+
+        pub fn turn_off_on(&mut self, display_index: u32) -> Result<()> {
+            self.with_display(display_index, |surface| surface.turn_off_selected())
+        }
+
         /// Select an already-open head when possible; single-head surfaces can
         /// still reopen on another built-in panel. Unknown routes keep the
         /// current surface so other configured touch panels remain active.
@@ -1682,10 +1840,14 @@ pub mod kms {
             if !super::can_power_down_heads(self.heads.len()) {
                 return Ok(());
             }
+            self.rest_selected()
+        }
+
+        fn rest_selected(&mut self) -> Result<()> {
             if self.power != Power::On {
                 return Ok(());
             }
-            let Some((id, _, rest)) = self.lp else { return self.turn_off() };
+            let Some((id, _, rest)) = self.lp else { return self.turn_off_selected() };
             self.settle()?;
             let mut req = atomic::AtomicModeReq::new();
             req.add_property(self.conn, id, property::Value::UnsignedRange(rest));
@@ -1701,6 +1863,10 @@ pub mod kms {
             if !super::can_power_down_heads(self.heads.len()) {
                 return Ok(());
             }
+            self.turn_off_selected()
+        }
+
+        fn turn_off_selected(&mut self) -> Result<()> {
             if self.power == Power::Off {
                 return Ok(());
             }
