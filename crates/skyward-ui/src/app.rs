@@ -2774,18 +2774,26 @@ pub fn enter_recovery_views<V: AppView>(primary: &mut App, views: &mut [V]) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CoverRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
 /// Copy a source rectangle to a destination rectangle, scaling only when the
 /// cover-panel keyboard expands from the content column to the full panel.
-fn cover_blit(src: &Canvas, dst: &mut Canvas, sx: u32, sy: u32, sw: u32, sh: u32, dx: u32, dy: u32, dw: u32, dh: u32) {
-    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+fn cover_blit(src: &Canvas, dst: &mut Canvas, source: CoverRect, dest: CoverRect) {
+    if source.w == 0 || source.h == 0 || dest.w == 0 || dest.h == 0 {
         return;
     }
-    for y in 0..dh {
-        let source_y = sy + ((y as u64 * sh as u64) / dh as u64) as u32;
-        for x in 0..dw {
-            let source_x = sx + ((x as u64 * sw as u64) / dw as u64) as u32;
+    for y in 0..dest.h {
+        let source_y = source.y + ((y as u64 * source.h as u64) / dest.h as u64) as u32;
+        for x in 0..dest.w {
+            let source_x = source.x + ((x as u64 * source.w as u64) / dest.w as u64) as u32;
             let from = ((source_y * src.w + source_x) * 4) as usize;
-            let to = (((dy + y) * dst.w + dx + x) * 4) as usize;
+            let to = (((dest.y + y) * dst.w + dest.x + x) * 4) as usize;
             dst.data[to..to + 4].copy_from_slice(&src.data[from..from + 4]);
         }
     }
@@ -4474,11 +4482,36 @@ impl App {
                 // The content column fills the space above the camera. The
                 // keyboard is compressed into the lower strip and spans the
                 // whole display; the camera cutout itself stays unobscured.
-                cover_blit(&cover.buffer, out, 0, 0, cover.buffer.w, top, cover.cutout_w, 0, cover.buffer.w, cover.cutout_h);
-                cover_blit(&cover.buffer, out, 0, top, cover.buffer.w, cover.full_h - top, 0, cover.cutout_h, cover.full_w, cover.full_h - cover.cutout_h);
+                cover_blit(
+                    &cover.buffer,
+                    out,
+                    CoverRect { x: 0, y: 0, w: cover.buffer.w, h: top },
+                    CoverRect { x: cover.cutout_w, y: 0, w: cover.buffer.w, h: cover.cutout_h },
+                );
+                cover_blit(
+                    &cover.buffer,
+                    out,
+                    CoverRect { x: 0, y: top, w: cover.buffer.w, h: cover.full_h - top },
+                    CoverRect {
+                        x: 0,
+                        y: cover.cutout_h,
+                        w: cover.full_w,
+                        h: cover.full_h - cover.cutout_h,
+                    },
+                );
             }
             None => {
-                cover_blit(&cover.buffer, out, 0, 0, cover.buffer.w, cover.full_h, cover.cutout_w, 0, cover.buffer.w, cover.full_h);
+                cover_blit(
+                    &cover.buffer,
+                    out,
+                    CoverRect { x: 0, y: 0, w: cover.buffer.w, h: cover.full_h },
+                    CoverRect {
+                        x: cover.cutout_w,
+                        y: 0,
+                        w: cover.buffer.w,
+                        h: cover.full_h,
+                    },
+                );
                 self.draw_cover_widgets(out, cover, f, info, clock);
             }
         }
