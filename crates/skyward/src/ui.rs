@@ -21,7 +21,7 @@ use skyward_block::{fstab, mount, probe};
 use skyward_config::{
     display_mode_selection_available, effective_display_mode, enabled_panel_count,
     primary_panel_for_display_mode, touch_panel_for_display, DeviceConfig, DisplayMode, Service,
-    TouchPanel,
+    PanelRole, TouchPanel,
 };
 use skyward_crypto::data::{Closed, Opened};
 use skyward_install::asked::{self, Needs};
@@ -145,6 +145,17 @@ struct SecondaryView {
 impl AppView for SecondaryView {
     fn app_mut(&mut self) -> &mut App {
         &mut self.app
+    }
+}
+
+
+/// Give the MIX Flip's external panel its camera-aware viewport while keeping
+/// every other device on the standard full-panel layout.
+fn panel_app(cfg: &DeviceConfig, panel: Option<&TouchPanel>, start: Screen, w: u32, h: u32, density: f32) -> App {
+    if cfg.device.codename == "ruyi" && panel.is_some_and(|panel| panel.role == PanelRole::External) {
+        App::new_cover(start, w, h, density)
+    } else {
+        App::new(start, w, h, density)
     }
 }
 
@@ -1225,6 +1236,21 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         .cloned()
         .collect();
     let display_summary = surface.describe_all();
+    let configured_panel_ids = cfg
+        .touch
+        .panels
+        .iter()
+        .map(|panel| format!("{}:{:?}", panel.display_index, panel.role))
+        .collect::<Vec<_>>()
+        .join(",");
+    let opened_panel_ids = opened_panels
+        .iter()
+        .map(|panel| format!("{}:{:?}", panel.display_index, panel.role))
+        .collect::<Vec<_>>()
+        .join(",");
+    skyward_sys::kmsg(&format!(
+        "panel bring-up: mode={selected_mode:?}, requested_primary={requested_primary_display_index}, actual_primary={primary_display_index}, configured=[{configured_panel_ids}], opened=[{opened_panel_ids}], KMS={display_summary}"
+    ))?;
     eprintln!("displays {display_summary}");
     skyward_sys::kmsg(&format!("displays {display_summary}"))?;
     if let Some(error) = surface.open_error() {
@@ -1253,7 +1279,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         | Work::SwitchSystem { .. }
         | Work::SystemStopped => start,
     };
-    let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
+    let mut app = panel_app(cfg, primary_panel.as_ref(), first, w, h, cfg.display.density as f32 / 160.0);
     app.set_screen_corners(cfg.display.corner_radius as f32);
     // The settings kept from the starts before are back before the first
     // frame, and before file transfer starts with its switch and the time
@@ -1286,7 +1312,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         let (panel_w, panel_h) = surface
             .size_for_display(panel.display_index)
             .ok_or_else(|| anyhow!("configured display {} did not open", panel.display_index))?;
-        let mut view_app = App::new(first, panel_w, panel_h, cfg.display.density as f32 / 160.0);
+        let mut view_app = panel_app(cfg, Some(panel), first, panel_w, panel_h, cfg.display.density as f32 / 160.0);
         view_app.set_screen_corners(cfg.display.corner_radius as f32);
         view_app.take_settings(kept.settings(), named);
         view_app.sync_shared_state_from(&app);

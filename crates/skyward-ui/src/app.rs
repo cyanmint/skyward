@@ -2738,11 +2738,25 @@ pub struct App {
     w: u32,
     h: u32,
     px_per_dp: f32,
+    cover: Option<CoverPanel>,
 }
 
 /// The page state owned by one display view.
 pub trait AppView {
     fn app_mut(&mut self) -> &mut App;
+}
+
+/// A Xiaomi MIX Flip cover-panel viewport: the camera occupies the upper
+/// left corner, the recovery uses the large area to its right, and a small
+/// widget rail sits below the camera.
+struct CoverPanel {
+    full_w: u32,
+    full_h: u32,
+    cutout_w: u32,
+    cutout_h: u32,
+    widget_page: usize,
+    gesture: Option<(f32, f32, f32)>,
+    buffer: Canvas,
 }
 
 impl AppView for App {
@@ -2757,6 +2771,23 @@ pub fn enter_recovery_views<V: AppView>(primary: &mut App, views: &mut [V]) {
     primary.enter_recovery();
     for view in views {
         view.app_mut().enter_recovery();
+    }
+}
+
+/// Copy a source rectangle to a destination rectangle, scaling only when the
+/// cover-panel keyboard expands from the content column to the full panel.
+fn cover_blit(src: &Canvas, dst: &mut Canvas, sx: u32, sy: u32, sw: u32, sh: u32, dx: u32, dy: u32, dw: u32, dh: u32) {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return;
+    }
+    for y in 0..dh {
+        let source_y = sy + ((y as u64 * sh as u64) / dh as u64) as u32;
+        for x in 0..dw {
+            let source_x = sx + ((x as u64 * sw as u64) / dw as u64) as u32;
+            let from = ((source_y * src.w + source_x) * 4) as usize;
+            let to = (((dy + y) * dst.w + dx + x) * 4) as usize;
+            dst.data[to..to + 4].copy_from_slice(&src.data[from..from + 4]);
+        }
     }
 }
 
@@ -2845,8 +2876,30 @@ impl App {
             w,
             h,
             px_per_dp,
+            cover: None,
         }
     }
+
+    /// Create an app for the Xiaomi MIX Flip's cover display. The supplied
+    /// 1208x1392 screenshots show a 399x758 camera-safe area; preserve those
+    /// measured proportions if the panel reports a different mode size.
+    pub fn new_cover(start: Screen, full_w: u32, full_h: u32, px_per_dp: f32) -> Self {
+        let cutout_w = ((full_w as f64 * 399.0 / 1208.0).round() as u32).clamp(1, full_w.saturating_sub(1));
+        let cutout_h = ((full_h as f64 * 758.0 / 1392.0).round() as u32).clamp(1, full_h.saturating_sub(1));
+        let content_w = full_w - cutout_w;
+        let mut app = Self::new(start, content_w, full_h, px_per_dp);
+        app.cover = Some(CoverPanel {
+            full_w,
+            full_h,
+            cutout_w,
+            cutout_h,
+            widget_page: 0,
+            gesture: None,
+            buffer: Canvas::new(content_w, full_h),
+        });
+        app
+    }
+
 
     /// The screen's corners are rounded to `radius` pixels: so are the
     /// leading corners of a page sliding over another.
@@ -4387,6 +4440,20 @@ impl App {
     /// while a cable has just gone in, both as dark as the content stands
     /// as the panel goes off or comes up.
     pub fn compose(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        let Some(mut cover) = self.cover.take() else {
+            return self.compose_standard(out, f, info, clock, now);
+        };
+        let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
+        if charge < 1.0 {
+            self.compose_page(&mut cover.buffer, f, info, clock, now);
+        }
+        if charge > 0.0 {
+            self.compose_charging(&mut cover.buffer, f, info, charge, now);
+        }
+        self.compose_cover_frame(out, &cover, f, info, clock, now);
+        self.cover = Some(cover);
+    }
+    fn compose_standard(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
         let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
         if charge < 1.0 {
             self.compose_page(out, f, info, clock, now);
@@ -4395,6 +4462,125 @@ impl App {
             self.compose_charging(out, f, info, charge, now);
         }
         out.dim(self.curtain.level(now));
+    }
+
+    fn compose_cover_frame(&self, out: &mut Canvas, cover: &CoverPanel, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        debug_assert_eq!((out.w, out.h), (cover.full_w, cover.full_h));
+        out.fill_rect(0.0, 0.0, cover.full_w as f32, cover.full_h as f32, Rgba::rgb(0, 0, 0));
+        let keyboard_top = self.cover_keyboard_top();
+        match keyboard_top {
+            Some(top) => {
+                let top = top.floor().clamp(0.0, cover.full_h as f32) as u32;
+                // The content column fills the space above the camera. The
+                // keyboard is compressed into the lower strip and spans the
+                // whole display; the camera cutout itself stays unobscured.
+                cover_blit(&cover.buffer, out, 0, 0, cover.buffer.w, top, cover.cutout_w, 0, cover.buffer.w, cover.cutout_h);
+                cover_blit(&cover.buffer, out, 0, top, cover.buffer.w, cover.full_h - top, 0, cover.cutout_h, cover.full_w, cover.full_h - cover.cutout_h);
+            }
+            None => {
+                cover_blit(&cover.buffer, out, 0, 0, cover.buffer.w, cover.full_h, cover.cutout_w, 0, cover.buffer.w, cover.full_h);
+                self.draw_cover_widgets(out, cover, f, info, clock);
+            }
+        }
+        out.dim(self.curtain.level(now));
+    }
+
+    fn cover_keyboard_top(&self) -> Option<f32> {
+        let frame = self.frame.as_ref()?;
+        let first = frame.hits.iter().filter_map(|hit| {
+            matches!(hit.action, Action::Type(_)).then_some(hit.rect.y)
+        }).min_by(f32::total_cmp)?;
+        Some((first - self.px_per_dp * 9.0).max(0.0))
+    }
+
+    fn draw_cover_widgets(&self, out: &mut Canvas, cover: &CoverPanel, f: &Fonts, info: &DeviceInfo, clock: &str) {
+        let t = self.theme();
+        let (left, top, width, height) = (cover.cutout_w as f32, cover.cutout_h as f32, cover.cutout_w as f32, (cover.full_h - cover.cutout_h) as f32);
+        out.fill_rect(0.0, top, width, height, t.pal.bg);
+        let pad_x = self.px_per_dp * 10.0;
+        let pad_top = self.px_per_dp * 4.0;
+        let pad_bottom = self.px_per_dp * 18.0;
+        let card_x = pad_x;
+        let card_y = top + pad_top;
+        let card_w = (width - pad_x * 2.0).max(1.0);
+        let card_h = (height - pad_top - pad_bottom).max(1.0);
+        out.fill_round_rect(card_x, card_y, card_w, card_h, self.px_per_dp * 10.0, t.pal.card);
+        let cx = left / 2.0;
+        let title_y = card_y + self.px_per_dp * 25.0;
+        let body = t.pal.text;
+        let subdued = t.pal.subtitle;
+        match cover.widget_page {
+            0 => {
+                out.text_center(&f.heading, "虚拟按键", cx, title_y, self.px_per_dp * 13.0, body);
+                let labels = ["返回", "主页", "搜索"];
+                let y = card_y + self.px_per_dp * 76.0;
+                let gap = self.px_per_dp * 3.0;
+                let button_w = (card_w - gap * 4.0) / 3.0;
+                for (i, label) in labels.iter().enumerate() {
+                    let x = card_x + gap + i as f32 * (button_w + gap);
+                    out.fill_round_rect(x, y, button_w, self.px_per_dp * 45.0, self.px_per_dp * 8.0, t.pal.badge);
+                    out.text_center(&f.body, label, x + button_w / 2.0, y + self.px_per_dp * 22.0, self.px_per_dp * 9.5, body);
+                }
+            }
+            1 => {
+                out.text_center(&f.heading, "时间与温度", cx, title_y, self.px_per_dp * 11.0, subdued);
+                out.text_center(&f.heading, clock, cx, card_y + self.px_per_dp * 75.0, self.px_per_dp * 21.0, body);
+                let temp = info.battery.as_ref().and_then(|battery| battery.temp).map_or_else(
+                    || "--°C".to_string(),
+                    |tenths| format!("{}.{:01}°C", tenths.div_euclid(10), tenths.rem_euclid(10)),
+                );
+                out.text_center(&f.body, &temp, cx, card_y + self.px_per_dp * 111.0, self.px_per_dp * 13.0, subdued);
+                let level = info.battery.as_ref().map_or_else(|| "电量 --%".to_string(), |battery| format!("电量 {}%", battery.level));
+                out.text_center(&f.body, &level, cx, card_y + self.px_per_dp * 141.0, self.px_per_dp * 9.5, subdued);
+            }
+            _ => {
+                out.text_center(&f.heading, "快捷开关", cx, title_y, self.px_per_dp * 13.0, body);
+                let labels = [if self.state.dark { "深色模式 开" } else { "深色模式 关" }, if self.state.brightness > 0.7 { "高亮度 开" } else { "高亮度 关" }, "设置与无线网络"];
+                for (i, label) in labels.iter().enumerate() {
+                    let y = card_y + self.px_per_dp * (66.0 + i as f32 * 42.0);
+                    out.fill_round_rect(card_x + self.px_per_dp * 5.0, y, card_w - self.px_per_dp * 10.0, self.px_per_dp * 34.0, self.px_per_dp * 7.0, t.pal.badge);
+                    out.text_center(&f.body, label, cx, y + self.px_per_dp * 17.0, self.px_per_dp * 9.5, body);
+                }
+            }
+        }
+        let dots = ["●", "●", "●"];
+        let pitch = self.px_per_dp * 14.0;
+        for (i, dot) in dots.iter().enumerate() {
+            out.text_center(&f.body, dot, cx + (i as f32 - 1.0) * pitch, card_y + card_h - self.px_per_dp * 18.0, self.px_per_dp * 5.0, if i == cover.widget_page { t.pal.accent } else { subdued });
+        }
+        out.text_center(&f.body, "上下滑动切换", cx, card_y + card_h - self.px_per_dp * 5.0, self.px_per_dp * 7.0, subdued);
+    }
+
+    fn cover_widget_tap(&mut self, x: f32, y: f32, now: u64) -> Vec<Effect> {
+        let Some(cover) = self.cover.as_ref() else { return Vec::new() };
+        let page = cover.widget_page;
+        let px = self.px_per_dp;
+        let card_top = cover.cutout_h as f32 + px * 8.0;
+        let button_top = card_top + px * 76.0;
+        if page == 0 && y >= button_top && y < button_top + px * 45.0 {
+            let third = cover.cutout_w as f32 / 3.0;
+            return match (x / third).floor() as usize {
+                0 => self.back(now),
+                1 => self.act(Action::Open(Screen::Home), now),
+                _ => self.act(Action::Open(Screen::Search), now),
+            };
+        }
+        if page == 2 {
+            let row = ((y - card_top - px * 58.0) / (px * 42.0)).floor() as i32;
+            match row {
+                0 => {
+                    self.state.dark = !self.state.dark;
+                    self.refresh();
+                }
+                1 => {
+                    self.state.brightness = if self.state.brightness > 0.7 { 0.45 } else { 1.0 };
+                    self.refresh();
+                }
+                2 => return self.act(Action::Open(Screen::Settings), now),
+                _ => {}
+            }
+        }
+        Vec::new()
     }
 
     /// The charging screen, `level` of the way over the page drawn on `out`.
@@ -6127,7 +6313,100 @@ impl App {
         Vec::new()
     }
 
+    fn cover_touch_event(&mut self, ev: Touch, now: u64) -> (Option<Touch>, Vec<Effect>) {
+        if self.cover.is_none() {
+            return (Some(ev), Vec::new());
+        }
+        let keyboard_top = self.cover_keyboard_top().map(|top| top.floor().clamp(0.0, self.h as f32) as u32);
+        let mut cover = self.cover.take().expect("checked above");
+        let content_y = |y: f32| match keyboard_top {
+            Some(top) => y * top as f32 / cover.cutout_h as f32,
+            None => y,
+        };
+        let keyboard_y = |y: f32| {
+            let top = keyboard_top.expect("keyboard area is active") as f32;
+            top + (y - cover.cutout_h as f32) * (cover.full_h - top as u32) as f32 / (cover.full_h - cover.cutout_h) as f32
+        };
+        let mut mapped = Some(ev);
+        let mut widget_tap = None;
+        let mut touched_widget = false;
+        if let Some((start_x, start_y, last_y)) = cover.gesture {
+            match ev {
+                Touch::Move(_, y) => {
+                    cover.gesture = Some((start_x, start_y, y));
+                    mapped = None;
+                }
+                Touch::Up => {
+                    let delta = last_y - start_y;
+                    if delta.abs() > self.px_per_dp * 12.0 {
+                        cover.widget_page = if delta < 0.0 { (cover.widget_page + 1).min(2) } else { cover.widget_page.saturating_sub(1) };
+                        self.dirty = true;
+                        touched_widget = true;
+                    } else {
+                        widget_tap = Some((start_x, start_y));
+                        touched_widget = true;
+                    }
+                    cover.gesture = None;
+                    mapped = None;
+                }
+                _ => {}
+            }
+        }
+        if mapped.is_some() {
+            match ev {
+                Touch::Down(x, y) => {
+                    if keyboard_top.is_some() {
+                        if y >= cover.cutout_h as f32 {
+                            mapped = Some(Touch::Down(
+                                x * cover.buffer.w as f32 / cover.full_w as f32,
+                                keyboard_y(y),
+                            ));
+                        } else if x < cover.cutout_w as f32 {
+                            mapped = None;
+                        } else {
+                            mapped = Some(Touch::Down(x - cover.cutout_w as f32, content_y(y)));
+                        }
+                    } else if x < cover.cutout_w as f32 {
+                        if y >= cover.cutout_h as f32 {
+                            cover.gesture = Some((x, y, y));
+                            touched_widget = true;
+                        }
+                        mapped = None;
+                    } else {
+                        mapped = Some(Touch::Down(x - cover.cutout_w as f32, y));
+                    }
+                }
+                Touch::Move(x, y) => {
+                    if keyboard_top.is_some() {
+                        if y >= cover.cutout_h as f32 {
+                            mapped = Some(Touch::Move(
+                                x * cover.buffer.w as f32 / cover.full_w as f32,
+                                keyboard_y(y),
+                            ));
+                        } else if x >= cover.cutout_w as f32 {
+                            mapped = Some(Touch::Move(x - cover.cutout_w as f32, content_y(y)));
+                        } else {
+                            mapped = Some(Touch::Move(0.0, content_y(y)));
+                        }
+                    } else if x >= cover.cutout_w as f32 {
+                        mapped = Some(Touch::Move(x - cover.cutout_w as f32, y));
+                    } else {
+                        mapped = Some(Touch::Move(0.0, y));
+                    }
+                }
+                Touch::Up => mapped = Some(Touch::Up),
+            }
+        }
+        self.cover = Some(cover);
+        if touched_widget {
+            self.stir(now);
+        }
+        let effects = widget_tap.map_or_else(Vec::new, |(x, y)| self.cover_widget_tap(x, y, now));
+        (mapped, effects)
+    }
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
+        let (ev, cover_fx) = self.cover_touch_event(ev, now);
+        let Some(ev) = ev else { return cover_fx };
         // A finger on the dark panel lights nothing, as on the phone's own
         // system, where the power key lights it.
         if !self.display_on {
@@ -6165,7 +6444,7 @@ impl App {
         let m = t.m;
         let (slop, edge) = (m.dp(8.0), m.dp(20.0));
         let scroll = self.top().1;
-        let mut fx = Vec::new();
+        let mut fx = cover_fx;
         let pressing = self.pressing();
         match ev {
             Touch::Down(x, y) => {
@@ -11951,5 +12230,58 @@ mod tests {
         assert!(app.state.language_chosen);
         assert!(app.dirty);
         assert_eq!(app.frame(&f, &info).canvas.w, 1208, "the page geometry is rebuilt for the new panel width");
+    }
+    #[test]
+    fn the_cover_menu_uses_the_full_panel_height_and_leaves_the_camera_clear() {
+        let (f, i) = (fonts(), info());
+        let (width, height) = (1208, 1392);
+        let mut app = App::new_cover(Screen::Reboot, width, height, 520.0 / 160.0);
+        let cover = app.cover.as_ref().unwrap();
+        assert_eq!((cover.cutout_w, cover.cutout_h), (399, 758), "camera-safe bounds match the supplied 1208x1392 reference");
+        assert_eq!((app.w, app.h), (809, height), "menu layout uses the full height, not only the strip below the camera");
+        let mut out = Canvas::new(width, height);
+        app.compose(&mut out, &f, &i, "12:00", 0);
+        let pixel = |x: u32, y: u32| {
+            let at = ((y * width + x) * 4) as usize;
+            &out.data[at..at + 4]
+        };
+        assert_eq!(&pixel(120, 120)[..3], &[0, 0, 0], "the physical camera area remains blank");
+        assert_ne!(&pixel(180, 850)[..3], &[0, 0, 0], "the widget rail is drawn below it");
+    }
+
+    #[test]
+    fn the_cover_widget_rail_pages_up_and_down_by_swipe() {
+        let mut app = App::new_cover(Screen::Home, 1208, 1392, 520.0 / 160.0);
+        let rail_x = app.cover.as_ref().unwrap().cutout_w as f32 / 2.0;
+        let rail_y = app.cover.as_ref().unwrap().cutout_h as f32 + 240.0;
+        app.cover_touch_event(Touch::Down(rail_x, rail_y), 10);
+        app.cover_touch_event(Touch::Move(rail_x, rail_y - 120.0), 20);
+        app.cover_touch_event(Touch::Up, 30);
+        assert_eq!(app.cover.as_ref().unwrap().widget_page, 1);
+        app.cover_touch_event(Touch::Down(rail_x, rail_y - 120.0), 40);
+        app.cover_touch_event(Touch::Move(rail_x, rail_y), 50);
+        app.cover_touch_event(Touch::Up, 60);
+        assert_eq!(app.cover.as_ref().unwrap().widget_page, 0);
+    }
+
+    #[test]
+    fn the_cover_keyboard_expands_below_the_camera_and_keeps_touch_coordinates_aligned() {
+        let (f, i) = (fonts(), info());
+        let (width, height) = (1208, 1392);
+        let mut app = App::new_cover(Screen::Search, width, height, 520.0 / 160.0);
+        let mut out = Canvas::new(width, height);
+        app.compose(&mut out, &f, &i, "12:00", 0);
+        let cover = app.cover.as_ref().unwrap();
+        let top = app.cover_keyboard_top().expect("search has a software keyboard").floor() as u32;
+        let cutout_h = cover.cutout_h;
+        assert_eq!(&out.data[((100 * width + 100) * 4) as usize..][..3], &[0, 0, 0], "keyboard composition does not paint over the camera");
+        let keyboard_pixel = ((cutout_h + 20) * width + 100) as usize * 4;
+        assert_ne!(&out.data[keyboard_pixel..keyboard_pixel + 3], &[0, 0, 0], "the keyboard fills the lower full-width area");
+        let target_y = cutout_h as f32 + 20.0;
+        let (mapped, _) = app.cover_touch_event(Touch::Down(width as f32 - 1.0, target_y), 10);
+        let Some(Touch::Down(x, y)) = mapped else { panic!("keyboard touch was not routed") };
+        let expected_y = top as f32 + 20.0 * (height - top) as f32 / (height - cutout_h) as f32;
+        assert!((x - (width - 1) as f32 * app.cover.as_ref().unwrap().buffer.w as f32 / width as f32).abs() < 0.01);
+        assert!((y - expected_y).abs() < 0.01, "mapped keyboard y={y}, expected {expected_y}");
     }
 }
