@@ -36,9 +36,9 @@ display_index = 1
 role = "external"
 width = 1208
 height = 1392
-# Rotate both the outer display and touchscreen 180 degrees so the
-# camera-safe area and touch coordinates match the panel orientation.
-display_rotation = 180
+# The visible cover output is 180 degrees relative to scanout; keep pixels
+# unrotated in software and correct touch coordinates independently.
+display_rotation = 0
 touch_rotation = 180
 
 # The stock fstab mounts modem at /vendor/firmware_mnt and persist at

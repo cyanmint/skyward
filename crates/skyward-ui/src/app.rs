@@ -2738,6 +2738,8 @@ pub struct App {
     w: u32,
     h: u32,
     px_per_dp: f32,
+    /// The cover keyboard fit remains available while its render buffer is detached.
+    cover_keyboard_scale_y: f32,
     cover: Option<CoverPanel>,
 }
 
@@ -2884,6 +2886,7 @@ impl App {
             w,
             h,
             px_per_dp,
+            cover_keyboard_scale_y: 1.0,
             cover: None,
         }
     }
@@ -2896,6 +2899,8 @@ impl App {
         let cutout_h = ((full_h as f64 * 758.0 / 1392.0).round() as u32).clamp(1, full_h.saturating_sub(1));
         let content_w = full_w - cutout_w;
         let mut app = Self::new(start, content_w, full_h, px_per_dp);
+        let natural = widgets::keyboard_height(&app.theme());
+        app.cover_keyboard_scale_y = ((full_h - cutout_h) as f32 / natural.max(1.0)).min(1.0);
         app.cover = Some(CoverPanel {
             full_w,
             full_h,
@@ -2921,11 +2926,7 @@ impl App {
         } else {
             Theme::light(self.w, self.h, self.px_per_dp)
         };
-        if let Some(cover) = &self.cover {
-            let available = (cover.full_h - cover.cutout_h) as f32;
-            let natural = widgets::keyboard_height(&theme);
-            theme.m.keyboard_scale_y = (available / natural.max(1.0)).min(1.0);
-        }
+        theme.m.keyboard_scale_y = self.cover_keyboard_scale_y;
         theme
     }
 
@@ -12330,6 +12331,57 @@ mod tests {
         assert!((layout.keys_top + t.m.dp(48.0) - cutout as f32).abs() < 0.01, "terminal shortcut row remains between output and keyboard");
         assert!((layout.card.y + layout.card.h + t.m.dp(10.0) - layout.keys_top).abs() < 0.01, "terminal output/prompt does not overlap its shortcut row");
         assert_eq!(terminal.term_size(&f), (layout.rows, layout.cols));
+    }
+
+    #[test]
+    fn cover_buffer_detachment_preserves_keyboard_geometry() {
+        let (f, info) = (fonts(), info());
+        let (w, h) = (1208, 1392);
+        let mut app = App::new_cover(Screen::Search, w, h, 520.0 / 160.0);
+        app.frame(&f, &info);
+        let expected_scale = app.theme().m.keyboard_scale_y;
+        let expected_top = app.cover_keyboard_top();
+        let cover = app
+            .cover
+            .take()
+            .expect("cover buffer is detached while it is rendered");
+        let during_render_scale = app.theme().m.keyboard_scale_y;
+        let during_render_top = app.cover_keyboard_top();
+        app.cover = Some(cover);
+        assert!((during_render_scale - expected_scale).abs() < 0.001);
+        assert_eq!(expected_top, Some(758.0));
+        assert_eq!(during_render_top, expected_top);
+    }
+
+    #[test]
+    fn cover_buffer_detachment_preserves_terminal_geometry() {
+        let (f, info) = (fonts(), info());
+        let (w, h) = (1208, 1392);
+        let mut app = App::new_cover(Screen::Terminal, w, h, 520.0 / 160.0);
+        app.frame(&f, &info);
+        let expected = app.term_size(&f);
+        let expected_layout = {
+            let t = app.theme();
+            term::layout(&t, &f, t.m.content_top)
+        };
+        let cover = app
+            .cover
+            .take()
+            .expect("cover buffer is detached while it is rendered");
+        let during_render = app.term_size(&f);
+        let during_render_layout = {
+            let t = app.theme();
+            term::layout(&t, &f, t.m.content_top)
+        };
+        app.cover = Some(cover);
+        assert_eq!(
+            during_render, expected,
+            "the PTY and rendered terminal keep the same rows and columns"
+        );
+        assert_eq!(
+            during_render_layout, expected_layout,
+            "the prompt viewport does not move into the keyboard"
+        );
     }
 
     #[test]
