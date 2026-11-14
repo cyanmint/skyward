@@ -2607,7 +2607,7 @@ const KEYBOARD_BOTTOM_DP: f32 = 26.0;
 /// How tall the keyboard is on this theme's screen.
 pub fn keyboard_height(t: &Theme) -> f32 {
     let m = &t.m;
-    m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * KEY_GAP_Y_DP + KEYBOARD_BOTTOM_DP)
+    m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * KEY_GAP_Y_DP + KEYBOARD_BOTTOM_DP) * m.keyboard_scale_y
 }
 
 /// The on-screen keyboard across the bottom of the screen, its top at
@@ -2625,10 +2625,11 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
         (Rgba::rgb(224, 226, 231), Rgba::rgb(255, 255, 255), Rgba::rgb(193, 198, 207), Rgba::rgb(0, 0, 0), Rgba::rgb(138, 141, 147))
     };
     c.fill_rect(0.0, top, w, keyboard_height(t), panel);
-    let (pad, gx, gy, kh) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(KEY_GAP_X_DP), m.dp(KEY_GAP_Y_DP), m.dp(KEY_H_DP));
+    let scale_y = m.keyboard_scale_y;
+    let (pad, gx, gy, kh) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(KEY_GAP_X_DP), m.dp(KEY_GAP_Y_DP) * scale_y, m.dp(KEY_H_DP) * scale_y);
     let kw = (w - pad * 2.0 - gx * 9.0) / 10.0;
     let side_w = kw * 1.35;
-    let row_top = |r: usize| top + m.dp(KEYBOARD_TOP_DP) + r as f32 * (kh + gy);
+    let row_top = |r: usize| top + m.dp(KEYBOARD_TOP_DP) * scale_y + r as f32 * (kh + gy);
     let mut keys: Vec<(Rect, Cap)> = Vec::new();
     let [first, second, third] = rows(layer);
     // Rows of plain keys are centred: the letters' second row sits half a

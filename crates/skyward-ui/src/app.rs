@@ -2916,11 +2916,17 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        if self.state.dark {
+        let mut theme = if self.state.dark {
             Theme::dark(self.w, self.h, self.px_per_dp)
         } else {
             Theme::light(self.w, self.h, self.px_per_dp)
+        };
+        if let Some(cover) = &self.cover {
+            let available = (cover.full_h - cover.cutout_h) as f32;
+            let natural = widgets::keyboard_height(&theme);
+            theme.m.keyboard_scale_y = (available / natural.max(1.0)).min(1.0);
         }
+        theme
     }
 
     pub fn screen(&self) -> Screen {
@@ -4480,8 +4486,8 @@ impl App {
             Some(top) => {
                 let top = top.floor().clamp(0.0, cover.full_h as f32) as u32;
                 // The content column fills the space above the camera. The
-                // keyboard is compressed into the lower strip and spans the
-                // whole display; the camera cutout itself stays unobscured.
+                // keyboard is laid out to the lower strip's height and spans
+                // the whole display without vertical resampling.
                 cover_blit(
                     &cover.buffer,
                     out,
@@ -4520,10 +4526,10 @@ impl App {
 
     fn cover_keyboard_top(&self) -> Option<f32> {
         let frame = self.frame.as_ref()?;
-        let first = frame.hits.iter().filter_map(|hit| {
-            matches!(hit.action, Action::Type(_)).then_some(hit.rect.y)
-        }).min_by(f32::total_cmp)?;
-        Some((first - self.px_per_dp * 9.0).max(0.0))
+        frame.hits.iter().any(|hit| matches!(hit.action, Action::Type(_))).then(|| {
+            let theme = self.theme();
+            self.h as f32 - widgets::keyboard_height(&theme)
+        })
     }
 
     fn draw_cover_widgets(&self, out: &mut Canvas, cover: &CoverPanel, f: &Fonts, info: &DeviceInfo, clock: &str) {
@@ -12264,6 +12270,68 @@ mod tests {
         assert!(app.dirty);
         assert_eq!(app.frame(&f, &info).canvas.w, 1208, "the page geometry is rebuilt for the new panel width");
     }
+    #[test]
+    fn cover_long_menus_can_scroll_to_their_last_control() {
+        let (f, info) = (fonts(), info());
+        for screen in [Screen::Advanced, Screen::Reboot] {
+            let mut app = App::new_cover(screen, 1208, 1392, 520.0 / 160.0);
+            let t = app.theme();
+            let viewport_h = app.h as f32;
+            let (page_h, last_rect) = {
+                let frame = app.frame(&f, &info);
+                let last = match screen {
+                    Screen::Advanced => Action::Open(Screen::Update),
+                    Screen::Reboot => Action::Confirm(Confirm::Reboot),
+                    _ => unreachable!(),
+                };
+                let rect = frame.hits.iter().find(|hit| hit.action == last).expect("last control exists").rect;
+                (frame.height(&t), rect)
+            };
+            assert!(page_h > viewport_h, "{screen:?} content extends below the viewport");
+            let max = app.max_scroll();
+            assert!(max > 0.0, "{screen:?} can scroll to its last control");
+            assert!(last_rect.y - max < viewport_h, "{screen:?} last control is visible at maximum scroll");
+            assert!(
+                last_rect.y + last_rect.h - max > t.m.content_top,
+                "{screen:?} last control bottom={} max={max} top={}",
+                last_rect.y + last_rect.h,
+                t.m.content_top
+            );
+        }
+    }
+
+    #[test]
+    fn cover_keyboard_and_terminal_viewport_have_no_vertical_scaling() {
+        let (f, info) = (fonts(), info());
+        let (w, h) = (1208, 1392);
+        let cutout = 758;
+        let mut app = App::new_cover(Screen::Search, w, h, 520.0 / 160.0);
+        app.frame(&f, &info);
+        let top = app.cover_keyboard_top().unwrap().floor() as u32;
+        assert_eq!(top, cutout, "keyboard begins at the camera-safe split");
+        let y = cutout as f32 + 20.0;
+        let (mapped, _) = app.cover_touch_event(Touch::Down(w as f32 - 1.0, y), 10);
+        let Some(Touch::Down(_, mapped_y)) = mapped else { panic!("keyboard touch was not routed") };
+        assert!((mapped_y - y).abs() < 0.01, "keyboard touch y={mapped_y}, expected {y}");
+        let t = app.theme();
+        let natural = Theme::light(w, h, 520.0 / 160.0);
+        let mut scaled_canvas = Canvas::new(w, h);
+        let scaled_keys = widgets::keyboard(&mut scaled_canvas, &t, &f, Lang::En, cutout as f32, widgets::Layer::Letters, None, "Enter");
+        let mut natural_canvas = Canvas::new(w, h);
+        let natural_keys = widgets::keyboard(&mut natural_canvas, &natural, &f, Lang::En, cutout as f32, widgets::Layer::Letters, None, "Enter");
+        let row_scale = (h - cutout) as f32 / widgets::keyboard_height(&natural);
+        assert!((t.m.keyboard_scale_y - row_scale).abs() < 0.001);
+        assert!((scaled_keys[0].0.h / natural_keys[0].0.h - row_scale).abs() < 0.001, "key rows are laid out shorter rather than resampled");
+        assert!(((scaled_keys[10].0.y - scaled_keys[0].0.y) / (natural_keys[10].0.y - natural_keys[0].0.y) - row_scale).abs() < 0.001, "row spacing uses the same vertical fit");
+        let terminal = App::new_cover(Screen::Terminal, w, h, 520.0 / 160.0);
+        let t = terminal.theme();
+        let layout = term::layout(&t, &f, t.m.content_top);
+        assert_eq!((h as f32 - widgets::keyboard_height(&t)).round() as u32, cutout);
+        assert!((layout.keys_top + t.m.dp(48.0) - cutout as f32).abs() < 0.01, "terminal shortcut row remains between output and keyboard");
+        assert!((layout.card.y + layout.card.h + t.m.dp(10.0) - layout.keys_top).abs() < 0.01, "terminal output/prompt does not overlap its shortcut row");
+        assert_eq!(terminal.term_size(&f), (layout.rows, layout.cols));
+    }
+
     #[test]
     fn the_cover_menu_uses_the_full_panel_height_and_leaves_the_camera_clear() {
         let (f, i) = (fonts(), info());

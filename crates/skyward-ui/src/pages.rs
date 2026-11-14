@@ -851,7 +851,7 @@ const UNREADABLE: Text = ["无法读取", "無法讀取", "Unreadable"];
 /// Reboot target picker with a swipe-to-confirm control.
 pub fn reboot(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
-    let mut c = page(cx);
+    let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
     let mut y = widgets::section_first(&mut c, t, f, top, l.pick(["重启到", "重新啟動到", "Reboot to"]));
@@ -888,7 +888,7 @@ pub fn reboot(cx: &Ctx) -> Frame {
     let (label, danger) = confirm_label(Confirm::Reboot, cx.state);
     let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
     out.push(Hit { rect: track, action: Action::Confirm(Confirm::Reboot) });
-    Frame::new(t, c, out, l.pick(REBOOT), top)
+    Frame::new(t, fit(c, t, track.y + track.h), out, l.pick(REBOOT), top)
 }
 
 /// Installing, opened from the home page: the system on the phone now, and
@@ -2239,7 +2239,7 @@ const STOP: Text = ["停止", "停止", "Stop"];
 /// Tools for the experienced.
 pub fn advanced(cx: &Ctx) -> Frame {
     let (t, f, l) = (cx.t, cx.f, cx.state.lang);
-    let mut c = page(cx);
+    let mut c = long_page(cx);
     let top = t.m.content_top;
     let tools = widgets::list(&mut c, t, f, top, &[
         Row::new(l.pick(FILES)).icon(BLUE, Icon::Folder),
@@ -2257,7 +2257,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Action::Open(Screen::Logs),
         Action::Open(Screen::Update),
     ]);
-    Frame::new(t, c, out, l.pick(ADVANCED), top)
+    Frame::new(t, fit(c, t, tools.bottom), out, l.pick(ADVANCED), top)
 }
 
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
