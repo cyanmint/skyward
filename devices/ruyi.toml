@@ -36,10 +36,10 @@ display_index = 1
 role = "external"
 width = 1208
 height = 1392
-# The tested cover scanout needs a 180-degree pixel transform, while its
-# touch coordinates already align with that oriented image.
+# Rotate both the outer display and touchscreen 180 degrees so the
+# camera-safe area and touch coordinates match the panel orientation.
 display_rotation = 180
-touch_rotation = 0
+touch_rotation = 180
 
 # The stock fstab mounts modem at /vendor/firmware_mnt and persist at
 # /mnt/vendor/persist. The vendor image points the WLAN settings and MAC

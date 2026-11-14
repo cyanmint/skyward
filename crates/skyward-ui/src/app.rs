@@ -4474,7 +4474,7 @@ impl App {
 
     fn compose_cover_frame(&self, out: &mut Canvas, cover: &CoverPanel, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
         debug_assert_eq!((out.w, out.h), (cover.full_w, cover.full_h));
-        out.fill_rect(0.0, 0.0, cover.full_w as f32, cover.full_h as f32, Rgba::rgb(0, 0, 0));
+        out.fill_rect(0.0, 0.0, cover.full_w as f32, cover.full_h as f32, self.theme().pal.bg);
         let keyboard_top = self.cover_keyboard_top();
         match keyboard_top {
             Some(top) => {
@@ -12278,7 +12278,8 @@ mod tests {
             let at = ((y * width + x) * 4) as usize;
             &out.data[at..at + 4]
         };
-        assert_eq!(&pixel(120, 120)[..3], &[0, 0, 0], "the physical camera area remains blank");
+        let bg = app.theme().pal.bg;
+        assert_eq!(&pixel(120, 120)[..3], &[bg.r, bg.g, bg.b], "the physical camera area uses the menu background");
         assert_ne!(&pixel(180, 850)[..3], &[0, 0, 0], "the widget rail is drawn below it");
     }
 
@@ -12307,7 +12308,8 @@ mod tests {
         let cover = app.cover.as_ref().unwrap();
         let top = app.cover_keyboard_top().expect("search has a software keyboard").floor() as u32;
         let cutout_h = cover.cutout_h;
-        assert_eq!(&out.data[((100 * width + 100) * 4) as usize..][..3], &[0, 0, 0], "keyboard composition does not paint over the camera");
+        let bg = app.theme().pal.bg;
+        assert_eq!(&out.data[((100 * width + 100) * 4) as usize..][..3], &[bg.r, bg.g, bg.b], "keyboard composition leaves the camera area in the menu background");
         let keyboard_pixel = ((cutout_h + 20) * width + 100) as usize * 4;
         assert_ne!(&out.data[keyboard_pixel..keyboard_pixel + 3], &[0, 0, 0], "the keyboard fills the lower full-width area");
         let target_y = cutout_h as f32 + 20.0;
