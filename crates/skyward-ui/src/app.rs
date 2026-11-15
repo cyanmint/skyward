@@ -2945,8 +2945,10 @@ impl App {
         let content_w = full_w - cutout_w;
         let mut app = Self::new(start, content_w, full_h, px_per_dp);
         app.is_cover = true;
-        let natural = widgets::keyboard_height(&app.theme());
-        app.cover_keyboard_scale_y = ((full_h - cutout_h) as f32 / natural.max(1.0)).min(1.0) * 0.46;
+        let mut keyboard_theme = app.theme();
+        keyboard_theme.m.w = full_w;
+        keyboard_theme.m.keyboard_scale_y = 1.0;
+        app.cover_keyboard_scale_y = widgets::cover_keyboard_scale(&keyboard_theme, (full_h - cutout_h) as f32);
         app.cover = Some(CoverPanel {
             full_w,
             full_h,
@@ -4600,12 +4602,37 @@ impl App {
 
     fn cover_widget_keyboard_view(&self, cover: &CoverPanel) -> Rect {
         let px = self.px_per_dp;
+        let y = cover.cutout_h as f32 + px * 62.0;
+        let bottom = (cover.full_h as f32 - px * 42.0).max(y);
+        let natural_height = widgets::keyboard_height(&self.cover_widget_keyboard_theme());
         Rect::new(
             px * 15.0,
-            cover.cutout_h as f32 + px * 62.0,
+            y,
             (cover.cutout_w as f32 - px * 30.0).max(0.0),
-            widgets::keyboard_height(&self.cover_widget_keyboard_theme()),
+            natural_height.min((bottom - y).max(0.0)),
         )
+    }
+
+    fn cover_widget_keyboard_preview_source(
+        &self,
+        cover: &CoverPanel,
+        view: Rect,
+        keyboard_w: u32,
+        keyboard_h: u32,
+    ) -> CoverRect {
+        let (view_w, view_h) = (view.w.floor().max(0.0) as u32, view.h.floor().max(0.0) as u32);
+        if view_w == 0 || view_h == 0 || keyboard_w == 0 || keyboard_h == 0 {
+            return CoverRect { x: 0, y: 0, w: 0, h: 0 };
+        }
+        let scale = view_h as f32 / keyboard_h as f32;
+        let source_w = ((view_w as f32 / scale).ceil() as u32).clamp(1, keyboard_w);
+        let max_x = keyboard_w - source_w;
+        CoverRect {
+            x: cover.keyboard_scroll_x.clamp(0.0, max_x as f32).round() as u32,
+            y: 0,
+            w: source_w,
+            h: keyboard_h,
+        }
     }
 
     fn cover_widget_keyboard_theme(&self) -> Theme {
@@ -4675,15 +4702,14 @@ impl App {
                 let view = self.cover_widget_keyboard_view(cover);
                 let (keyboard, _) = self.cover_widget_keyboard_art(f);
                 let view_w = view.w.floor().max(0.0) as u32;
-                let view_h = (view.h.ceil() as u32).min(keyboard.h);
-                let max_x = keyboard.w.saturating_sub(view_w) as f32;
-                let source_x = cover.keyboard_scroll_x.clamp(0.0, max_x).round() as u32;
+                let view_h = view.h.floor().max(0.0) as u32;
+                let source = self.cover_widget_keyboard_preview_source(cover, view, keyboard.w, keyboard.h);
                 let x = view.x.round().max(0.0) as u32;
                 let y = view.y.round().max(0.0) as u32;
                 cover_blit(
                     &keyboard,
                     out,
-                    CoverRect { x: source_x, y: 0, w: view_w, h: view_h },
+                    source,
                     CoverRect { x, y, w: view_w, h: view_h },
                 );
             }
@@ -4744,11 +4770,15 @@ impl App {
             let view = self.cover_widget_keyboard_view(cover);
             if view.contains(x, y) {
                 let (keyboard, keys) = self.cover_widget_keyboard_art(f);
-                let max_x = keyboard.w.saturating_sub(view.w.floor().max(0.0) as u32) as f32;
-                let key_x = x - view.x + cover.keyboard_scroll_x.clamp(0.0, max_x);
-                let key_y = y - view.y;
-                if let Some((_, cap)) = keys.iter().find(|(rect, _)| rect.contains(key_x, key_y)) {
-                    return self.act(Action::Type(*cap), now);
+                let view_w = view.w.floor().max(0.0);
+                let view_h = view.h.floor().max(0.0);
+                if view_w > 0.0 && view_h > 0.0 {
+                    let source = self.cover_widget_keyboard_preview_source(cover, view, keyboard.w, keyboard.h);
+                    let key_x = source.x as f32 + (x - view.x) * source.w as f32 / view_w;
+                    let key_y = (y - view.y) * source.h as f32 / view_h;
+                    if let Some((_, cap)) = keys.iter().find(|(rect, _)| rect.contains(key_x, key_y)) {
+                        return self.act(Action::Type(*cap), now);
+                    }
                 }
             }
         }
@@ -6619,8 +6649,12 @@ impl App {
                         touched_widget = true;
                     } else if cover.widget_page == 2 && dx.abs() > threshold {
                         let view = self.cover_widget_keyboard_view(&cover);
-                        let max_x = (self.w as f32 - view.w).max(0.0);
-                        cover.keyboard_scroll_x = (cover.keyboard_scroll_x - dx).clamp(0.0, max_x);
+                        let keyboard_h = widgets::keyboard_height(&self.cover_widget_keyboard_theme()).ceil().max(1.0) as u32;
+                        let view_w = view.w.floor().max(0.0) as u32;
+                        let source = self.cover_widget_keyboard_preview_source(&cover, view, cover.full_w, keyboard_h);
+                        let max_x = cover.full_w.saturating_sub(source.w) as f32;
+                        let scale_x = if source.w > 0 { view_w as f32 / source.w as f32 } else { 1.0 };
+                        cover.keyboard_scroll_x = (cover.keyboard_scroll_x - dx / scale_x.max(f32::EPSILON)).clamp(0.0, max_x);
                         self.dirty = true;
                         touched_widget = true;
                     } else if dx.abs() <= threshold && dy.abs() <= threshold {
@@ -12532,6 +12566,107 @@ mod tests {
     }
 
     #[test]
+    fn cover_keyboard_keys_are_square_on_the_cover_panel() {
+        let (f, info) = (fonts(), info());
+        let (w, h) = (1208, 1392);
+        let mut app = App::new_cover(Screen::Search, w, h, 520.0 / 160.0);
+        app.frame(&f, &info);
+        let theme = app.cover_widget_keyboard_theme();
+        let (_, keys) = app.cover_widget_keyboard_art(&f);
+        let rect = keys.iter().find(|(_, cap)| *cap == Cap::Char('q')).unwrap().0;
+        let painted_width = rect.w - theme.m.dp(2.0);
+        let painted_height = rect.h - theme.m.dp(11.0) * theme.m.keyboard_scale_y;
+        let ratio = painted_height / painted_width;
+        assert!((ratio - 1.0).abs() <= 0.10, "cover keys should be nearly square: width={painted_width}, height={painted_height}, ratio={ratio}");
+        assert!(widgets::keyboard_height(&theme) >= 450.0, "the cover keyboard should use more vertical space");
+    }
+
+    #[test]
+    fn cover_keyboard_touch_types_the_character_displayed_by_each_key() {
+        let (f, info) = (fonts(), info());
+        for layer in [Layer::Letters, Layer::Shifted, Layer::Digits, Layer::Symbols] {
+            let mut app = App::new_cover(Screen::Search, 1208, 1392, 520.0 / 160.0);
+            app.state.layer = layer;
+            app.cover_keyboard_requested = true;
+            app.frame(&f, &info);
+            let (_, keys) = app.cover_widget_keyboard_art(&f);
+            let top = app.cover_keyboard_top().expect("search keyboard is visible");
+            let printable: Vec<_> = keys.into_iter().filter(|(_, cap)| matches!(cap, Cap::Char(_))).collect();
+            for (index, (rect, cap)) in printable.into_iter().enumerate() {
+                let Cap::Char(ch) = cap else { unreachable!() };
+                app.state.search.clear();
+                app.state.layer = layer;
+                app.refresh();
+                app.frame(&f, &info);
+                let x = rect.x + rect.w / 2.0;
+                let y = top + rect.y + rect.h / 2.0;
+                let now = 10 + index as u64 * 2;
+                app.touch(Touch::Down(x, y), &f, now);
+                app.touch(Touch::Up, &f, now + 1);
+                let shown = if layer == Layer::Shifted { ch.to_ascii_uppercase() } else { ch };
+                assert_eq!(app.state.search, shown.to_string(), "{layer:?} key {ch:?} must type its displayed character");
+            }
+        }
+    }
+
+    #[test]
+    fn cover_special_key_taps_send_the_sequence_for_the_displayed_key() {
+        let (f, info) = (fonts(), info());
+        let cases: &[(Cap, &[u8])] = &[
+            (Cap::Special(SpecialKey::Esc), b"\x1b"),
+            (Cap::Special(SpecialKey::Left), b"\x1b[D"),
+            (Cap::Special(SpecialKey::Up), b"\x1b[A"),
+            (Cap::Special(SpecialKey::Down), b"\x1b[B"),
+            (Cap::Special(SpecialKey::Right), b"\x1b[C"),
+            (Cap::Special(SpecialKey::Tab), b"\t"),
+            (Cap::Special(SpecialKey::Delete), b"\x1b[3~"),
+            (Cap::Special(SpecialKey::F1), b"\x1bOP"),
+            (Cap::Special(SpecialKey::F2), b"\x1bOQ"),
+            (Cap::Special(SpecialKey::F3), b"\x1bOR"),
+            (Cap::Special(SpecialKey::F4), b"\x1bOS"),
+            (Cap::Special(SpecialKey::F5), b"\x1b[15~"),
+            (Cap::Special(SpecialKey::F6), b"\x1b[17~"),
+            (Cap::Special(SpecialKey::F7), b"\x1b[18~"),
+            (Cap::Special(SpecialKey::F8), b"\x1b[19~"),
+            (Cap::Special(SpecialKey::F9), b"\x1b[20~"),
+            (Cap::Special(SpecialKey::F10), b"\x1b[21~"),
+            (Cap::Special(SpecialKey::F11), b"\x1b[23~"),
+            (Cap::Special(SpecialKey::F12), b"\x1b[24~"),
+            (Cap::Special(SpecialKey::Home), b"\x1b[H"),
+            (Cap::Special(SpecialKey::End), b"\x1b[F"),
+            (Cap::Special(SpecialKey::PageUp), b"\x1b[5~"),
+            (Cap::Special(SpecialKey::PageDown), b"\x1b[6~"),
+            (Cap::Special(SpecialKey::Insert), b"\x1b[2~"),
+            (Cap::Special(SpecialKey::PrintScreen), b"\x1b[?~"),
+            (Cap::Backspace, &[0x7f]),
+            (Cap::Space, b" "),
+            (Cap::Meta, b"\x1b"),
+            (Cap::Enter, b"\r"),
+        ];
+        let mut tested = vec![false; cases.len()];
+        for layer in [Layer::Letters, Layer::Digits, Layer::Symbols] {
+            let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+            app.state.layer = layer;
+            app.cover_keyboard_requested = true;
+            app.term = Some(term::Term::new(24, 60));
+            for (index, (cap, expected)) in cases.iter().enumerate() {
+                app.refresh();
+                app.frame(&f, &info);
+                let (_, keys) = app.cover_widget_keyboard_art(&f);
+                let Some(rect) = keys.iter().find(|(_, key)| key == cap).map(|(rect, _)| *rect) else { continue; };
+                let top = app.cover_keyboard_top().expect("terminal keyboard is visible");
+                let (x, y) = (rect.x + rect.w / 2.0, top + rect.y + rect.h / 2.0);
+                let now = 10 + index as u64 * 2;
+                let mut effects = app.touch(Touch::Down(x, y), &f, now);
+                effects.extend(app.touch(Touch::Up, &f, now + 1));
+                assert_eq!(effects, vec![Effect::TermInput(expected.to_vec())], "{layer:?} key {cap:?}");
+                tested[index] = true;
+            }
+        }
+        assert!(tested.iter().all(|was_tested| *was_tested), "each displayed terminal key must be verified");
+    }
+
+    #[test]
     fn cover_keyboard_paints_over_the_widget_column_and_keeps_camera_cutout_clear() {
         let (f, info) = (fonts(), info());
         let (w, h) = (1208, 1392);
@@ -12571,31 +12706,31 @@ mod tests {
     }
 
     #[test]
-    fn cover_keyboard_keeps_compact_geometry_and_terminal_viewport() {
+    fn cover_keyboard_uses_squareish_keys_and_preserves_terminal_viewport() {
         let (f, info) = (fonts(), info());
         let (w, h) = (1208, 1392);
         let cutout = 758;
         let mut app = App::new_cover(Screen::Search, w, h, 520.0 / 160.0);
         app.frame(&f, &info);
         let top = app.cover_keyboard_top().unwrap().floor() as u32;
-        assert!(top > cutout, "the short keyboard starts below the camera-safe split");
+        assert!(top > cutout, "the enlarged keyboard fits below the camera-safe split");
         let y = top as f32 + 20.0;
         let (mapped, _) = app.cover_touch_event(Touch::Down(w as f32 - 1.0, y), 10, &f);
         let Some(Touch::Down(_, mapped_y)) = mapped else { panic!("keyboard touch was not routed") };
         assert!((mapped_y - y).abs() < 0.01, "keyboard touch y={mapped_y}, expected {y}");
         let t = app.cover_widget_keyboard_theme();
-        let natural = Theme::light(w, h, 520.0 / 160.0);
         let mut scaled_canvas = Canvas::new(w, h);
         let scaled_keys = widgets::keyboard(&mut scaled_canvas, &t, &f, Lang::En, top as f32, widgets::Layer::Letters, None, "Enter");
-        let mut natural_canvas = Canvas::new(w, h);
-        let natural_keys = widgets::keyboard(&mut natural_canvas, &natural, &f, Lang::En, top as f32, widgets::Layer::Letters, None, "Enter");
         let row_scale = t.m.keyboard_scale_y;
-        assert!(row_scale < 0.5, "the cover keyboard is not vertically expanded");
-        assert!((scaled_keys[0].0.h / natural_keys[0].0.h - row_scale).abs() < 0.001, "key rows are compact rather than stretched");
+        assert!(row_scale > 0.6 && row_scale <= 1.0, "cover keys use most of their natural height");
+        let cover_key = scaled_keys.iter().find(|(_, cap)| *cap == Cap::Char('q')).unwrap().0;
+        let painted_width = cover_key.w - t.m.dp(2.0);
+        let painted_height = cover_key.h - t.m.dp(11.0) * row_scale;
+        assert!((painted_height / painted_width - 1.0).abs() <= 0.10, "painted cover key is squareish");
         let scaled_pitch = scaled_keys[12].0.y - scaled_keys[0].0.y;
         let compact_pitch = t.m.dp(48.0) * row_scale;
-        assert!((scaled_pitch - compact_pitch).abs() < 0.01, "compact rows use the 44dp key and 4dp gap: actual={scaled_pitch} expected={compact_pitch}");
-        let last_row = scaled_keys[35].0;
+        assert!((scaled_pitch - compact_pitch).abs() < 0.01, "row pitch retains the 44dp key and 4dp gap: actual={scaled_pitch} expected={compact_pitch}");
+        let last_row = scaled_keys.iter().max_by(|a, b| a.0.y.total_cmp(&b.0.y)).unwrap().0;
         let hit_padding = t.m.dp(11.0) * row_scale / 2.0;
         let painted_bottom = last_row.y + last_row.h - hit_padding - top as f32;
         let advertised_height = widgets::keyboard_height(&t);
@@ -12992,9 +13127,19 @@ mod tests {
         app.act(Action::Type(Cap::Hide), 10);
         app.cover.as_mut().unwrap().widget_page = 2;
         let view = app.cover_widget_keyboard_view(app.cover.as_ref().unwrap());
-        let (_, keys) = app.cover_widget_keyboard_art(&f);
+        let (keyboard, keys) = app.cover_widget_keyboard_art(&f);
         let rect = keys.iter().find(|(_, cap)| *cap == Cap::Char('q')).expect("keyboard contains Q").0;
-        app.cover_widget_tap(view.x + rect.x + rect.w / 2.0, view.y + rect.y + rect.h / 2.0, 20, &f);
+        let source = app.cover_widget_keyboard_preview_source(
+            app.cover.as_ref().unwrap(),
+            view,
+            keyboard.w,
+            keyboard.h,
+        );
+        let view_w = view.w.floor();
+        let view_h = view.h.floor();
+        let x = view.x + (rect.x + rect.w / 2.0 - source.x as f32) * view_w / source.w as f32;
+        let y = view.y + (rect.y + rect.h / 2.0 - source.y as f32) * view_h / source.h as f32;
+        app.cover_widget_tap(x, y, 20, &f);
         assert_eq!(app.state.search, "q");
     }
 
@@ -13005,6 +13150,13 @@ mod tests {
         let mut app = App::new_cover(Screen::Home, w, h, 520.0 / 160.0);
         app.frame(&f, &info);
         app.cover.as_mut().unwrap().widget_page = 2;
+        let preview = app.cover_widget_keyboard_view(app.cover.as_ref().unwrap());
+        assert!(
+            preview.y + preview.h <= h as f32,
+            "keyboard preview must stay inside the cover framebuffer: y={} height={} screen={h}",
+            preview.y,
+            preview.h
+        );
         let mut before = Canvas::new(w, h);
         app.compose(&mut before, &f, &info, "12:00", 10);
         let x = app.cover.as_ref().unwrap().cutout_w as f32 * 0.75;

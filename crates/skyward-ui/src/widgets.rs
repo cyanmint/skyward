@@ -958,8 +958,8 @@ pub struct SearchField {
     pub caret: Caret,
 }
 
-/// A compact keyboard that keeps its source-pixel geometry on the narrow
-/// content pane of a Mix Flip cover display.
+/// The full-width Mix Flip cover keyboard, sized so each key is square
+/// where the camera-safe panel height allows it.
 #[allow(clippy::too_many_arguments)]
 fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: Layer, pressed: Option<Cap>, enter: &str) -> Vec<(Rect, Cap)> {
     let m = &t.m;
@@ -984,11 +984,11 @@ fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer
             add(0, 1, 1, Cap::Special(SpecialKey::Up));
             for (i, ch) in first.chars().enumerate() { add(0, i + 2, 1, Cap::Char(ch)); }
             add(1, 0, 1, Cap::Special(SpecialKey::Left));
-            add(1, 1, 1, Cap::Hide);
+            add(1, 1, 1, Cap::Special(SpecialKey::Right));
             for (i, ch) in second.chars().enumerate() { add(1, i + 2, 1, Cap::Char(ch)); }
-            add(1, 11, 1, Cap::Special(SpecialKey::Right));
-            add(2, 0, 1, Cap::Special(SpecialKey::Down));
-            add(2, 1, 1, Cap::Shift);
+            add(1, 11, 1, Cap::Hide);
+            add(2, 0, 1, Cap::Shift);
+            add(2, 1, 1, Cap::Special(SpecialKey::Down));
             for (i, ch) in third.chars().enumerate() { add(2, i + 2, 1, Cap::Char(ch)); }
             add(2, 9, 1, Cap::Backspace);
             add(2, 10, 1, Cap::Special(SpecialKey::Delete));
@@ -1000,11 +1000,11 @@ fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer
             add(0, 1, 1, Cap::Special(SpecialKey::Up));
             for (i, ch) in first.chars().enumerate() { add(0, i + 2, 1, Cap::Char(ch)); }
             add(1, 0, 1, Cap::Special(SpecialKey::Left));
-            add(1, 1, 1, Cap::Hide);
+            add(1, 1, 1, Cap::Special(SpecialKey::Right));
             for (i, ch) in second.chars().take(9).enumerate() { add(1, i + 2, 1, Cap::Char(ch)); }
-            add(1, 11, 1, Cap::Special(SpecialKey::Right));
-            add(2, 0, 1, Cap::Special(SpecialKey::Down));
-            add(2, 1, 1, Cap::Shift);
+            add(1, 11, 1, Cap::Hide);
+            add(2, 0, 1, Cap::Shift);
+            add(2, 1, 1, Cap::Special(SpecialKey::Down));
             let extra = second.chars().skip(9).chain(third.chars()).chain(std::iter::once(':'));
             for (i, ch) in extra.enumerate() { add(2, i + 2, 1, Cap::Char(ch)); }
             add(2, 9, 1, Cap::Backspace);
@@ -2800,6 +2800,17 @@ const KEYBOARD_TOP_DP: f32 = 9.0;
 /// Room under the last row for the gesture area of the screen's edge.
 const KEYBOARD_BOTTOM_DP: f32 = 26.0;
 
+/// Scale the cover keyboard to square keys without exceeding its available band.
+pub fn cover_keyboard_scale(t: &Theme, available_height: f32) -> f32 {
+    let m = &t.m;
+    let (pad, gap) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(2.0));
+    let key_width = (m.w as f32 - pad * 2.0 - gap * 11.0) / 12.0;
+    let square_scale = key_width / m.dp(KEY_H_DP);
+    let natural_height = m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * KEY_GAP_Y_DP + KEYBOARD_BOTTOM_DP);
+    let fit_scale = available_height.max(0.0) / natural_height.max(1.0);
+    square_scale.min(fit_scale).clamp(0.0, 1.0)
+}
+
 /// How tall the keyboard is on this theme's screen.
 pub fn keyboard_height(t: &Theme) -> f32 {
     let m = &t.m;
@@ -3074,6 +3085,40 @@ mod tests {
             } else {
                 assert_eq!(row_y(Cap::Meta), bottom, "Meta remains available on the bottom row");
             }
+        }
+    }
+
+    #[test]
+    fn cover_arrow_cluster_and_hide_key_match_their_positions() {
+        let f = crate::font::bundled();
+        let (w, h) = (1208, 1392);
+        let mut t = Theme::light(w, h, 520.0 / 160.0);
+        t.m.cover_keyboard = true;
+        t.m.keyboard_scale_y = 0.8;
+        let pad = t.m.dp(KEYBOARD_PAD_X_DP);
+        let gap = t.m.dp(2.0);
+        let unit = (w as f32 - 2.0 * pad - 11.0 * gap) / 12.0 + gap;
+        for layer in [Layer::Letters, Layer::Digits] {
+            let mut canvas = Canvas::new(w, keyboard_height(&t).ceil() as u32);
+            let keys = keyboard(&mut canvas, &t, &f, Lang::En, 0.0, layer, None, "Enter");
+            let row_tops: Vec<i32> = {
+                let mut values: Vec<_> = keys.iter().map(|(r, _)| (r.y * 100.0).round() as i32).collect();
+                values.sort_unstable();
+                values.dedup();
+                values
+            };
+            let position = |cap| {
+                let rect = keys.iter().find(|(_, key)| *key == cap).expect("key is present").0;
+                let row = row_tops.iter().position(|top| *top == (rect.y * 100.0).round() as i32).unwrap();
+                let col = ((rect.x - (pad - gap / 2.0)) / unit).round() as usize;
+                (row, col)
+            };
+            assert_eq!(position(Cap::Special(SpecialKey::Up)), (0, 1));
+            assert_eq!(position(Cap::Special(SpecialKey::Left)), (1, 0));
+            assert_eq!(position(Cap::Special(SpecialKey::Right)), (1, 1));
+            assert_eq!(position(Cap::Special(SpecialKey::Down)), (2, 1));
+            assert_eq!(position(Cap::Hide), (1, 11));
+            assert_eq!(position(Cap::Shift), (2, 0));
         }
     }
 
