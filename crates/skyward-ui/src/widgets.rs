@@ -958,6 +958,130 @@ pub struct SearchField {
     pub caret: Caret,
 }
 
+/// A compact keyboard that keeps its source-pixel geometry on the narrow
+/// content pane of a Mix Flip cover display.
+#[allow(clippy::too_many_arguments)]
+fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: Layer, pressed: Option<Cap>, enter: &str) -> Vec<(Rect, Cap)> {
+    let m = &t.m;
+    let w = m.w as f32;
+    let scale = m.keyboard_scale_y;
+    let (panel, key, side, ink, shadow) = if t.dark {
+        (Rgba::rgb(18, 18, 18), Rgba::rgb(58, 58, 58), Rgba::rgb(38, 38, 38), Rgba::rgb(237, 237, 237), Rgba::rgb(0, 0, 0))
+    } else {
+        (Rgba::rgb(224, 226, 231), Rgba::rgb(255, 255, 255), Rgba::rgb(193, 198, 207), Rgba::rgb(0, 0, 0), Rgba::rgb(138, 141, 147))
+    };
+    c.fill_rect(0.0, top, w, keyboard_height(t), panel);
+    let (pad, gx, gy, kh) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(2.0), m.dp(4.0) * scale, m.dp(KEY_H_DP) * scale);
+    let cell = (w - pad * 2.0 - gx * 11.0) / 12.0;
+    let row_top = |row: usize| top + m.dp(KEYBOARD_TOP_DP) * scale + row as f32 * (kh + gy);
+    let mut key_rows = Vec::with_capacity(4);
+    let [first, second, third] = rows(layer);
+    let mut one = vec![Cap::Special(SpecialKey::Esc), Cap::Special(SpecialKey::Up)];
+    one.extend(first.chars().map(Cap::Char));
+    key_rows.push((one, false));
+    let mut two = vec![Cap::Special(SpecialKey::Left), Cap::Hide, Cap::Special(SpecialKey::Right)];
+    two.extend(second.chars().map(Cap::Char));
+    key_rows.push((two, false));
+    let mut three = vec![Cap::Special(SpecialKey::Down)];
+    three.extend(third.chars().map(Cap::Char));
+    three.extend([Cap::Backspace, Cap::Special(SpecialKey::Delete), Cap::Special(SpecialKey::Tab)]);
+    key_rows.push((three, false));
+    let switch = match layer {
+        Layer::Letters | Layer::Shifted => Cap::Show(Layer::Digits),
+        Layer::Digits => Cap::Show(Layer::Symbols),
+        Layer::Symbols => Cap::Show(Layer::Digits),
+    };
+    key_rows.push((vec![switch, Cap::Char(','), Cap::Space, Cap::Char('.'), Cap::Meta, Cap::Enter], true));
+
+    let mut keys = Vec::new();
+    for (row, (caps, weighted)) in key_rows.into_iter().enumerate() {
+        if weighted {
+            let weights = [1.15, 0.9, 3.8, 0.9, 1.35, 1.9];
+            let unit = (w - pad * 2.0 - gx * (caps.len() - 1) as f32) / weights.iter().sum::<f32>();
+            let total = weights.iter().sum::<f32>() * unit + gx * (caps.len() - 1) as f32;
+            let mut x = (w - total) / 2.0;
+            for (cap, weight) in caps.into_iter().zip(weights) {
+                let width = unit * weight;
+                keys.push((Rect::new(x, row_top(row), width, kh), cap));
+                x += width + gx;
+            }
+        } else {
+            let count = caps.len();
+            let total = count as f32 * cell + (count.saturating_sub(1)) as f32 * gx;
+            let mut x = (w - total) / 2.0;
+            for cap in caps {
+                keys.push((Rect::new(x, row_top(row), cell, kh), cap));
+                x += cell + gx;
+            }
+        }
+    }
+
+    let radius = m.dp(KEY_RADIUS_DP) * scale;
+    let glyph_px = m.dp(15.0) * scale;
+    for &(r, cap) in &keys {
+        let plain = matches!(cap, Cap::Char(_) | Cap::Space);
+        let base = match cap {
+            Cap::Enter => t.pal.accent,
+            Cap::Shift if layer == Layer::Shifted => key,
+            _ if plain => key,
+            _ => side,
+        };
+        let fill = if pressed == Some(cap) { mix(base, ink, 0.16) } else { base };
+        if !t.dark {
+            c.fill_round_rect(r.x, r.y + scale, r.w, r.h, radius, shadow.with_alpha(110));
+        }
+        c.fill_round_rect(r.x, r.y, r.w, r.h, radius, fill);
+        let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+        match cap {
+            Cap::Char(ch) => {
+                let label = if layer == Layer::Shifted { ch.to_ascii_uppercase() } else { ch };
+                c.text_center(&f.body, &label.to_string(), cx, cy, glyph_px, ink);
+            }
+            Cap::Space => c.text_center(&f.body, l.pick(["空格", "空格", "Space"]), cx, cy, glyph_px, ink),
+            Cap::Enter => c.text_center(&f.body, enter, cx, cy, glyph_px, Rgba::rgb(255, 255, 255)),
+            Cap::Show(Layer::Digits) => c.text_center(&f.body, "123", cx, cy, glyph_px, ink),
+            Cap::Show(Layer::Symbols) => c.text_center(&f.body, "#+=", cx, cy, glyph_px, ink),
+            Cap::Show(_) => c.text_center(&f.body, "abc", cx, cy, glyph_px, ink),
+            Cap::Special(key) => {
+                let label = match key {
+                    SpecialKey::Esc => "Esc",
+                    SpecialKey::Left => "←",
+                    SpecialKey::Up => "↑",
+                    SpecialKey::Down => "↓",
+                    SpecialKey::Right => "→",
+                    SpecialKey::Tab => "Tab",
+                    SpecialKey::Delete => "Del",
+                };
+                c.text_center(&f.body, label, cx, cy, glyph_px, ink);
+            }
+            Cap::Hide => c.text_center(&f.body, "隐", cx, cy, glyph_px, ink),
+            Cap::Meta => c.text_center(&f.body, "Meta", cx, cy, glyph_px, ink),
+            Cap::Modifier(key) => {
+                let label = match key {
+                    ModifierKey::Shift => "Shift",
+                    ModifierKey::Fn => "Fn",
+                    ModifierKey::Alt => "Alt",
+                    ModifierKey::Ctrl => "Ctrl",
+                };
+                c.text_center(&f.body, label, cx, cy, glyph_px, ink);
+            }
+            Cap::Backspace => {
+                let (hw, hh) = (m.dp(7.0) * scale, m.dp(5.0) * scale);
+                let pts = [(cx - hw, cy), (cx - hw * 0.45, cy - hh), (cx + hw, cy - hh), (cx + hw, cy + hh), (cx - hw * 0.45, cy + hh)];
+                for k in 0..pts.len() {
+                    let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+                    c.line(a.0, a.1, b.0, b.1, m.dp(1.2) * scale, ink);
+                }
+                c.line(cx - scale, cy - scale, cx + scale, cy + scale, m.dp(1.2) * scale, ink);
+                c.line(cx - scale, cy + scale, cx + scale, cy - scale, m.dp(1.2) * scale, ink);
+            }
+            Cap::Shift => {}
+        }
+    }
+    let touch_y = m.dp(KEY_GAP_Y_DP) * scale;
+    keys.into_iter().map(|(r, cap)| (Rect::new(r.x - gx / 2.0, r.y - touch_y / 2.0, r.w + gx, r.h + touch_y), cap)).collect()
+}
+
 /// A text field's cursor: the stretch of the field it stands in, drawn
 /// again with it, and where that stretch goes. The field itself is drawn
 /// without it, so the cursor blinks as this is laid over the field or not.
@@ -2572,6 +2696,27 @@ pub enum Layer {
     Symbols,
 }
 
+/// A modifier key placed beside the MIX Flip's compact keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModifierKey {
+    Shift,
+    Fn,
+    Alt,
+    Ctrl,
+}
+
+/// A non-printing key on the compact cover keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialKey {
+    Esc,
+    Left,
+    Up,
+    Down,
+    Right,
+    Tab,
+    Delete,
+}
+
 /// A key of the on-screen keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cap {
@@ -2582,6 +2727,10 @@ pub enum Cap {
     Enter,
     /// Show another layer.
     Show(Layer),
+    Special(SpecialKey),
+    Hide,
+    Modifier(ModifierKey),
+    Meta,
 }
 
 /// The keys between the side keys of each row, per layer. Together the
@@ -2610,6 +2759,16 @@ pub fn keyboard_height(t: &Theme) -> f32 {
     m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * KEY_GAP_Y_DP + KEYBOARD_BOTTOM_DP) * m.keyboard_scale_y
 }
 
+/// The keyboard's visible top edge, or `None` when a cover keyboard is hidden.
+/// Layout, drawing, and hit targets use this same visibility decision.
+pub fn keyboard_top(t: &Theme) -> Option<f32> {
+    if t.m.cover_keyboard && t.m.keyboard_scale_y <= 0.0 {
+        None
+    } else {
+        Some(t.m.h as f32 - keyboard_height(t))
+    }
+}
+
 /// The on-screen keyboard across the bottom of the screen, its top at
 /// `top`: four rows of keys in `layer`, `pressed` drawn held down, and the
 /// return key saying what it does; its words in `l`. Returns where each
@@ -2618,6 +2777,9 @@ pub fn keyboard_height(t: &Theme) -> f32 {
 #[allow(clippy::too_many_arguments)]
 pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: Layer, pressed: Option<Cap>, enter: &str) -> Vec<(Rect, Cap)> {
     let m = &t.m;
+    if m.cover_keyboard {
+        return cover_keyboard(c, t, f, l, top, layer, pressed, enter);
+    }
     let w = m.w as f32;
     let (panel, key, side, ink, shadow) = if t.dark {
         (Rgba::rgb(18, 18, 18), Rgba::rgb(58, 58, 58), Rgba::rgb(38, 38, 38), Rgba::rgb(237, 237, 237), Rgba::rgb(0, 0, 0))
@@ -2719,6 +2881,29 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
                     }
                 }
             }
+            Cap::Special(key) => {
+                let label = match key {
+                    SpecialKey::Esc => "Esc",
+                    SpecialKey::Left => "←",
+                    SpecialKey::Up => "↑",
+                    SpecialKey::Down => "↓",
+                    SpecialKey::Right => "→",
+                    SpecialKey::Tab => "Tab",
+                    SpecialKey::Delete => "Del",
+                };
+                c.text_center(&f.body, label, cx, cy, m.sub_px, ink);
+            }
+            Cap::Hide => c.text_center(&f.body, "隐", cx, cy, m.sub_px, ink),
+            Cap::Modifier(key) => {
+                let label = match key {
+                    ModifierKey::Shift => "Shift",
+                    ModifierKey::Fn => "Fn",
+                    ModifierKey::Alt => "Alt",
+                    ModifierKey::Ctrl => "Ctrl",
+                };
+                c.text_center(&f.body, label, cx, cy, m.sub_px, ink);
+            }
+            Cap::Meta => c.text_center(&f.body, "Meta", cx, cy, m.sub_px, ink),
             Cap::Backspace => {
                 // A key cap pointing left, with a cross in it.
                 let (hw, hh) = (m.dp(11.0), m.dp(8.0));
@@ -2780,6 +2965,42 @@ mod tests {
             }
         }
         b
+    }
+
+    #[test]
+    fn cover_keyboard_keeps_the_requested_navigation_keys_and_bottom_row_on_every_symbol_layer() {
+        let f = crate::font::bundled();
+        let mut t = Theme::light(809, 1392, 520.0 / 160.0);
+        t.m.cover_keyboard = true;
+        t.m.keyboard_scale_y = 0.37;
+        let required = [
+            Cap::Special(SpecialKey::Esc),
+            Cap::Special(SpecialKey::Up),
+            Cap::Special(SpecialKey::Left),
+            Cap::Hide,
+            Cap::Special(SpecialKey::Right),
+            Cap::Special(SpecialKey::Down),
+            Cap::Backspace,
+            Cap::Special(SpecialKey::Delete),
+            Cap::Special(SpecialKey::Tab),
+        ];
+        for layer in [Layer::Letters, Layer::Digits, Layer::Symbols] {
+            let mut canvas = Canvas::new(809, keyboard_height(&t).ceil() as u32);
+            let keys = keyboard(&mut canvas, &t, &f, Lang::En, 0.0, layer, None, "Enter");
+            let caps: Vec<_> = keys.iter().map(|(_, cap)| *cap).collect();
+            for cap in required {
+                assert!(caps.contains(&cap), "{layer:?} is missing {cap:?}");
+            }
+            for cap in [Cap::Char(','), Cap::Space, Cap::Char('.'), Cap::Meta, Cap::Enter] {
+                assert!(caps.contains(&cap), "{layer:?} does not preserve the bottom row key {cap:?}");
+            }
+            let switch = match layer {
+                Layer::Letters | Layer::Shifted => Cap::Show(Layer::Digits),
+                Layer::Digits => Cap::Show(Layer::Symbols),
+                Layer::Symbols => Cap::Show(Layer::Digits),
+            };
+            assert!(caps.contains(&switch), "{layer:?} has the wrong 123/#+= switch");
+        }
     }
 
     #[test]

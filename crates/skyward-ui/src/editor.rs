@@ -248,6 +248,89 @@ impl Editor {
         self.follow();
     }
 
+    /// Move to the start or end of the current logical line.
+    pub fn home(&mut self) {
+        self.at = 0;
+        self.tail = false;
+        self.goal = None;
+        self.follow();
+    }
+
+    pub fn end(&mut self) {
+        self.at = self.lines[self.line].chars().count();
+        self.tail = false;
+        self.goal = None;
+        self.follow();
+    }
+
+    /// Move to the start or end of the whole file.
+    pub fn first(&mut self) {
+        self.line = 0;
+        self.at = 0;
+        self.tail = false;
+        self.goal = None;
+        self.follow();
+    }
+
+    pub fn last(&mut self) {
+        self.line = self.lines.len() - 1;
+        self.at = self.lines[self.line].chars().count();
+        self.tail = false;
+        self.goal = None;
+        self.follow();
+    }
+
+    /// Move to the previous or next whitespace-delimited word boundary.
+    pub fn word_left(&mut self) {
+        while let Some(ch) = self.char_before() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            self.left();
+        }
+        while let Some(ch) = self.char_before() {
+            if ch.is_whitespace() {
+                break;
+            }
+            self.left();
+        }
+    }
+
+    pub fn word_right(&mut self) {
+        while let Some(ch) = self.char_after() {
+            if ch.is_whitespace() {
+                break;
+            }
+            self.right();
+        }
+        while let Some(ch) = self.char_after() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            self.right();
+        }
+    }
+
+    fn char_before(&self) -> Option<char> {
+        if self.at > 0 {
+            self.lines[self.line].chars().nth(self.at - 1)
+        } else if self.line > 0 {
+            Some('\n')
+        } else {
+            None
+        }
+    }
+
+    fn char_after(&self) -> Option<char> {
+        if self.at < self.lines[self.line].chars().count() {
+            self.lines[self.line].chars().nth(self.at)
+        } else if self.line + 1 < self.lines.len() {
+            Some('\n')
+        } else {
+            None
+        }
+    }
+
     /// Type `ch` at the cursor.
     pub fn insert(&mut self, ch: char) {
         let text = &mut self.lines[self.line];
@@ -283,6 +366,21 @@ impl Editor {
             let text = &mut self.lines[self.line];
             self.at = text.chars().count();
             text.push_str(&rest);
+            self.edited(self.line);
+        }
+    }
+
+    /// Take away the character at the cursor; at the end of a line, join
+    /// it to the line after.
+    pub fn delete(&mut self) {
+        if self.at < self.lines[self.line].chars().count() {
+            let text = &mut self.lines[self.line];
+            text.remove(byte(text, self.at));
+            self.edited(self.line);
+        } else if self.line + 1 < self.lines.len() {
+            let rest = self.lines.remove(self.line + 1);
+            self.rows.remove(self.line + 1);
+            self.lines[self.line].push_str(&rest);
             self.edited(self.line);
         }
     }

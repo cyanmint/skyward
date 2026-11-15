@@ -87,6 +87,7 @@ pub struct Metrics {
     pub px_per_dp: f32,
     /// A cover display can shorten keyboard rows without changing the rest of the UI.
     pub keyboard_scale_y: f32,
+    pub cover_keyboard: bool,
     pub margin: f32,
     pub card_radius: f32,
     pub card_gap: f32,
@@ -183,6 +184,7 @@ fn metrics(w: u32, h: u32, px_per_dp: f32) -> Metrics {
         h,
         px_per_dp,
         keyboard_scale_y: 1.0,
+        cover_keyboard: false,
         margin: dp(12.0),
         card_radius: dp(20.0),
         card_gap: dp(12.0),

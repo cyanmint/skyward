@@ -1795,7 +1795,7 @@ pub fn wipe(cx: &Ctx) -> Frame {
 /// A page laid out above the on-screen keyboard: where the keyboard's top
 /// is, and its keys as touch targets.
 fn keyboard_hits(c: &mut Canvas, t: &Theme, f: &Fonts, s: &State, enter: &str, out: &mut Vec<Hit>) -> f32 {
-    let top = t.m.h as f32 - widgets::keyboard_height(t);
+    let Some(top) = widgets::keyboard_top(t) else { return t.m.h as f32; };
     let keys = widgets::keyboard(c, t, f, s.lang, top, s.layer, s.key_held(), enter);
     out.extend(keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }));
     top
@@ -3468,8 +3468,10 @@ pub fn terminal(cx: &Ctx) -> Frame {
     let l = term::layout(t, f, top);
     term::draw(&mut c, t, f, &l, cx.term);
     let held = cx.term.is_some_and(|term| term.ctrl);
-    let keys = term::keys(&mut c, t, f, &l, &term::TERM_KEYS, held);
-    out.extend(keys.into_iter().map(|(rect, key)| Hit { rect, action: Action::TermKey(key) }));
+    if !t.m.cover_keyboard {
+        let keys = term::keys(&mut c, t, f, &l, &term::TERM_KEYS, held);
+        out.extend(keys.into_iter().map(|(rect, key)| Hit { rect, action: Action::TermKey(key) }));
+    }
     Frame { scrollback: Some((l.card, l.pitch)), ..Frame::new(t, c, out, s.lang.pick(TERMINAL), top) }
 }
 
@@ -3523,7 +3525,7 @@ pub fn time_zone(cx: &Ctx) -> Frame {
 /// Saving the logs, as a bug report asks for them.
 pub fn logs(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
-    let mut c = page(cx);
+    let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
     let y = widgets::section_first(&mut c, t, f, top, l.pick(["日志内容", "記錄內容", "Logs"]));
@@ -3556,7 +3558,7 @@ pub fn logs(cx: &Ctx) -> Frame {
     let y = widgets::footnote(&mut c, t, f, places.bottom, note);
     let export = widgets::button(&mut c, t, f, y + t.m.dp(24.0), l.pick(["导出", "匯出", "Export"]));
     out.push(Hit { rect: export, action: Action::ExportLogs });
-    Frame::new(t, c, out, l.pick(LOGS), top)
+    Frame::new(t, fit(c, t, export.y + export.h), out, l.pick(LOGS), top)
 }
 
 /// Skyward's licence, in Chinese, ahead of the words the licence gives for

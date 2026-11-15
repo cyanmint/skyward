@@ -6,7 +6,7 @@ use crate::color::{mix, Rgba};
 use crate::font::Fonts;
 use crate::geom::Rect;
 use crate::theme::Theme;
-use crate::widgets::{self, Cap};
+use crate::widgets::{self, Cap, SpecialKey};
 use std::num::NonZeroU16;
 
 /// Lines kept above the screen to scroll back to.
@@ -94,7 +94,17 @@ impl Term {
             // and the shell both take as erasing.
             Cap::Backspace => vec![0x7f],
             Cap::Enter => vec![b'\r'],
-            Cap::Shift | Cap::Show(_) => {
+            Cap::Special(key) => match key {
+                SpecialKey::Esc => vec![0x1b],
+                SpecialKey::Tab => vec![b'\t'],
+                SpecialKey::Delete => vec![0x1b, b'[', b'3', b'~'],
+                SpecialKey::Left => self.key(TermKey::Left),
+                SpecialKey::Up => self.key(TermKey::Up),
+                SpecialKey::Down => self.key(TermKey::Down),
+                SpecialKey::Right => self.key(TermKey::Right),
+            },
+            Cap::Meta => vec![0x1b],
+            Cap::Hide | Cap::Modifier(_) | Cap::Shift | Cap::Show(_) => {
                 self.ctrl = ctrl;
                 Vec::new()
             }
@@ -127,7 +137,7 @@ impl Term {
 }
 
 /// The control code Ctrl makes of a character, where it makes one.
-fn control(ch: char) -> Option<u8> {
+pub(crate) fn control(ch: char) -> Option<u8> {
     match ch {
         'a'..='z' | 'A'..='Z' => Some(ch.to_ascii_uppercase() as u8 - b'@'),
         '@' | '[' | '\\' | ']' | '^' | '_' => Some(ch as u8 - b'@'),
@@ -159,8 +169,14 @@ pub struct Layout {
 pub fn layout(t: &Theme, f: &Fonts, top: f32) -> Layout {
     let m = &t.m;
     let px = m.dp(TEXT_DP);
-    let keys_top = m.h as f32 - widgets::keyboard_height(t) - m.dp(KEYS_GAP_DP + KEYS_H_DP);
-    let card = Rect::new(m.margin, top, m.w as f32 - m.margin * 2.0, keys_top - m.dp(KEYS_GAP_DP) - top);
+    let keyboard_top = widgets::keyboard_top(t);
+    let keys_top = if m.cover_keyboard {
+        keyboard_top.unwrap_or(m.h as f32)
+    } else {
+        keyboard_top.unwrap_or(m.h as f32) - m.dp(KEYS_GAP_DP + KEYS_H_DP)
+    };
+    let card_bottom = if m.cover_keyboard && keyboard_top.is_none() { m.h as f32 } else { keys_top - m.dp(KEYS_GAP_DP) };
+    let card = Rect::new(m.margin, top, m.w as f32 - m.margin * 2.0, card_bottom - top);
     let pad = m.dp(PAD_DP);
     let cell = cell_width(f, px);
     let pitch = m.dp(PITCH_DP);
