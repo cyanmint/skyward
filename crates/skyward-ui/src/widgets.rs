@@ -971,7 +971,7 @@ fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer
         (Rgba::rgb(224, 226, 231), Rgba::rgb(255, 255, 255), Rgba::rgb(193, 198, 207), Rgba::rgb(0, 0, 0), Rgba::rgb(138, 141, 147))
     };
     c.fill_rect(0.0, top, w, keyboard_height(t), panel);
-    let (pad, gx, gy, kh) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(2.0), m.dp(4.0) * scale, m.dp(KEY_H_DP) * scale);
+    let (pad, gx, gy, kh) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(2.0), m.dp(COVER_KEY_GAP_Y_DP) * scale, m.dp(KEY_H_DP) * scale);
     let cell = (w - pad * 2.0 - gx * 11.0) / 12.0;
     let unit = cell + gx;
     let row_top = |row: usize| top + m.dp(KEYBOARD_TOP_DP) * scale + row as f32 * (kh + gy);
@@ -1113,8 +1113,15 @@ fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer
             Cap::Meta => c.text_center(&f.body, "Meta", cx, cy, glyph_px, ink),
         }
     }
-    let touch_y = m.dp(KEY_GAP_Y_DP) * scale;
-    keys.into_iter().map(|(r, cap)| (Rect::new(r.x - gx / 2.0, r.y - touch_y / 2.0, r.w + gx, r.h + touch_y), cap)).collect()
+    let touch_y = gy;
+    keys.into_iter()
+        .map(|(r, cap)| {
+            (
+                Rect::new(r.x - gx / 2.0, r.y - touch_y / 2.0, r.w + gx, r.h + touch_y),
+                cap,
+            )
+        })
+        .collect()
 }
 
 fn draw_keyboard_glyph(c: &mut Canvas, cx: f32, cy: f32, size: f32, stroke: f32, ink: Rgba) {
@@ -2795,6 +2802,7 @@ const KEY_H_DP: f32 = 44.0;
 pub const KEY_RADIUS_DP: f32 = 6.0;
 const KEY_GAP_X_DP: f32 = 5.5;
 const KEY_GAP_Y_DP: f32 = 11.0;
+const COVER_KEY_GAP_Y_DP: f32 = 4.0;
 const KEYBOARD_PAD_X_DP: f32 = 3.5;
 const KEYBOARD_TOP_DP: f32 = 9.0;
 /// Room under the last row for the gesture area of the screen's edge.
@@ -2806,7 +2814,8 @@ pub fn cover_keyboard_scale(t: &Theme, available_height: f32) -> f32 {
     let (pad, gap) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(2.0));
     let key_width = (m.w as f32 - pad * 2.0 - gap * 11.0) / 12.0;
     let square_scale = key_width / m.dp(KEY_H_DP);
-    let natural_height = m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * KEY_GAP_Y_DP + KEYBOARD_BOTTOM_DP);
+    let natural_height =
+        m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * COVER_KEY_GAP_Y_DP + KEYBOARD_BOTTOM_DP);
     let fit_scale = available_height.max(0.0) / natural_height.max(1.0);
     square_scale.min(fit_scale).clamp(0.0, 1.0)
 }
@@ -2814,7 +2823,12 @@ pub fn cover_keyboard_scale(t: &Theme, available_height: f32) -> f32 {
 /// How tall the keyboard is on this theme's screen.
 pub fn keyboard_height(t: &Theme) -> f32 {
     let m = &t.m;
-    m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * KEY_GAP_Y_DP + KEYBOARD_BOTTOM_DP) * m.keyboard_scale_y
+    let row_gap = if m.cover_keyboard {
+        COVER_KEY_GAP_Y_DP
+    } else {
+        KEY_GAP_Y_DP
+    };
+    m.dp(KEYBOARD_TOP_DP + 4.0 * KEY_H_DP + 3.0 * row_gap + KEYBOARD_BOTTOM_DP) * m.keyboard_scale_y
 }
 
 /// The keyboard's visible top edge, or `None` when a cover keyboard is hidden.

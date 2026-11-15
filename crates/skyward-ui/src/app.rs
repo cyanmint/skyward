@@ -12575,7 +12575,7 @@ mod tests {
         let (_, keys) = app.cover_widget_keyboard_art(&f);
         let rect = keys.iter().find(|(_, cap)| *cap == Cap::Char('q')).unwrap().0;
         let painted_width = rect.w - theme.m.dp(2.0);
-        let painted_height = rect.h - theme.m.dp(11.0) * theme.m.keyboard_scale_y;
+        let painted_height = rect.h - theme.m.dp(4.0) * theme.m.keyboard_scale_y;
         let ratio = painted_height / painted_width;
         assert!((ratio - 1.0).abs() <= 0.10, "cover keys should be nearly square: width={painted_width}, height={painted_height}, ratio={ratio}");
         assert!(widgets::keyboard_height(&theme) >= 450.0, "the cover keyboard should use more vertical space");
@@ -12607,6 +12607,36 @@ mod tests {
                 assert_eq!(app.state.search, shown.to_string(), "{layer:?} key {ch:?} must type its displayed character");
             }
         }
+    }
+
+    #[test]
+    fn cover_keyboard_tap_at_a_key_edge_does_not_activate_the_next_row() {
+        let (f, info) = (fonts(), info());
+        let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+        app.cover_keyboard_requested = true;
+        app.term = Some(term::Term::new(24, 60));
+        app.frame(&f, &info);
+        let (_, keys) = app.cover_widget_keyboard_art(&f);
+        let rect = keys
+            .iter()
+            .find(|(_, cap)| *cap == Cap::Char('q'))
+            .unwrap()
+            .0;
+        let theme = app.cover_widget_keyboard_theme();
+        let hit_pad_y = theme.m.dp(4.0) * theme.m.keyboard_scale_y;
+        let painted_bottom = rect.y + hit_pad_y / 2.0 + rect.h - hit_pad_y;
+        let (x, y) = (
+            rect.x + rect.w / 2.0,
+            app.cover_keyboard_top().unwrap() + painted_bottom - 1.0,
+        );
+        let now = 10;
+        app.touch(Touch::Down(x, y), &f, now);
+        let effects = app.touch(Touch::Up, &f, now + 1);
+        assert_eq!(
+            effects,
+            vec![Effect::TermInput(b"q".to_vec())],
+            "the bottom edge of Q must not type the A below it"
+        );
     }
 
     #[test]
@@ -12664,6 +12694,56 @@ mod tests {
             }
         }
         assert!(tested.iter().all(|was_tested| *was_tested), "each displayed terminal key must be verified");
+    }
+
+    #[test]
+    fn cover_keyboard_every_key_edge_hits_the_key_it_paints() {
+        let (f, info) = (fonts(), info());
+        for layer in [
+            Layer::Letters,
+            Layer::Shifted,
+            Layer::Digits,
+            Layer::Symbols,
+        ] {
+            let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+            app.state.layer = layer;
+            app.cover_keyboard_requested = true;
+            app.term = Some(term::Term::new(24, 60));
+            let top = app.cover_keyboard_top().expect("keyboard is visible");
+            let scroll = app.top().1;
+            let theme = app.cover_widget_keyboard_theme();
+            let (keyboard, keys) = app.cover_widget_keyboard_art(&f);
+            assert_eq!(keyboard.w, 1208);
+            let (pad_x, pad_y) = (theme.m.dp(2.0), theme.m.dp(4.0) * theme.m.keyboard_scale_y);
+            let frame = app.frame(&f, &info);
+            for (hit_rect, cap) in keys {
+                let painted = Rect::new(
+                    hit_rect.x + pad_x / 2.0,
+                    hit_rect.y + pad_y / 2.0,
+                    hit_rect.w - pad_x,
+                    hit_rect.h - pad_y,
+                );
+                let samples = [
+                    (painted.w / 2.0, painted.h / 2.0),
+                    (0.5, painted.h / 2.0),
+                    (painted.w - 0.5, painted.h / 2.0),
+                    (painted.w / 2.0, 0.5),
+                    (painted.w / 2.0, painted.h - 0.5),
+                ];
+                for (dx, dy) in samples {
+                    let x = painted.x + dx;
+                    let y = top + painted.y + dy + scroll;
+                    let hit = frame
+                        .hit(x, y)
+                        .unwrap_or_else(|| panic!("{layer:?} {cap:?} has a hit at ({x}, {y})"));
+                    assert_eq!(
+                        hit.action,
+                        Action::Type(cap),
+                        "{layer:?} {cap:?} at ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -12821,13 +12901,13 @@ mod tests {
         assert!(row_scale > 0.6 && row_scale <= 1.0, "cover keys use most of their natural height");
         let cover_key = scaled_keys.iter().find(|(_, cap)| *cap == Cap::Char('q')).unwrap().0;
         let painted_width = cover_key.w - t.m.dp(2.0);
-        let painted_height = cover_key.h - t.m.dp(11.0) * row_scale;
+        let painted_height = cover_key.h - t.m.dp(4.0) * row_scale;
         assert!((painted_height / painted_width - 1.0).abs() <= 0.10, "painted cover key is squareish");
         let scaled_pitch = scaled_keys[12].0.y - scaled_keys[0].0.y;
         let compact_pitch = t.m.dp(48.0) * row_scale;
         assert!((scaled_pitch - compact_pitch).abs() < 0.01, "row pitch retains the 44dp key and 4dp gap: actual={scaled_pitch} expected={compact_pitch}");
         let last_row = scaled_keys.iter().max_by(|a, b| a.0.y.total_cmp(&b.0.y)).unwrap().0;
-        let hit_padding = t.m.dp(11.0) * row_scale / 2.0;
+        let hit_padding = t.m.dp(4.0) * row_scale / 2.0;
         let painted_bottom = last_row.y + last_row.h - hit_padding - top as f32;
         let advertised_height = widgets::keyboard_height(&t);
         assert!(painted_bottom <= advertised_height, "all four painted rows fit: bottom={painted_bottom} height={advertised_height} hit={last_row:?} padding={hit_padding}");
