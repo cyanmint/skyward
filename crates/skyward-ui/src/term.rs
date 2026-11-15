@@ -102,6 +102,24 @@ impl Term {
                 SpecialKey::Up => self.key(TermKey::Up),
                 SpecialKey::Down => self.key(TermKey::Down),
                 SpecialKey::Right => self.key(TermKey::Right),
+                SpecialKey::Home => b"\x1b[H".to_vec(),
+                SpecialKey::End => b"\x1b[F".to_vec(),
+                SpecialKey::PageUp => b"\x1b[5~".to_vec(),
+                SpecialKey::PageDown => b"\x1b[6~".to_vec(),
+                SpecialKey::Insert => b"\x1b[2~".to_vec(),
+                SpecialKey::PrintScreen => b"\x1b[?~".to_vec(),
+                SpecialKey::F1 => b"\x1bOP".to_vec(),
+                SpecialKey::F2 => b"\x1bOQ".to_vec(),
+                SpecialKey::F3 => b"\x1bOR".to_vec(),
+                SpecialKey::F4 => b"\x1bOS".to_vec(),
+                SpecialKey::F5 => b"\x1b[15~".to_vec(),
+                SpecialKey::F6 => b"\x1b[17~".to_vec(),
+                SpecialKey::F7 => b"\x1b[18~".to_vec(),
+                SpecialKey::F8 => b"\x1b[19~".to_vec(),
+                SpecialKey::F9 => b"\x1b[20~".to_vec(),
+                SpecialKey::F10 => b"\x1b[21~".to_vec(),
+                SpecialKey::F11 => b"\x1b[23~".to_vec(),
+                SpecialKey::F12 => b"\x1b[24~".to_vec(),
             },
             Cap::Meta => vec![0x1b],
             Cap::Hide | Cap::Modifier(_) | Cap::Shift | Cap::Show(_) => {
@@ -351,6 +369,20 @@ mod tests {
         assert!(term.typed(Cap::Show(Layer::Digits), false).is_empty());
         assert_eq!(term.key(TermKey::Esc), [0x1b]);
         assert_eq!(term.key(TermKey::Tab), b"\t");
+    }
+
+    #[test]
+    fn function_and_navigation_keys_send_terminal_sequences() {
+        let mut term = Term::new(24, 80);
+        assert_eq!(term.typed(Cap::Special(SpecialKey::F1), false), b"\x1bOP");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::F4), false), b"\x1bOS");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::F5), false), b"\x1b[15~");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::F12), false), b"\x1b[24~");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::Home), false), b"\x1b[H");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::End), false), b"\x1b[F");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::PageUp), false), b"\x1b[5~");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::PageDown), false), b"\x1b[6~");
+        assert_eq!(term.typed(Cap::Special(SpecialKey::Insert), false), b"\x1b[2~");
     }
 
     #[test]

@@ -973,63 +973,104 @@ fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer
     c.fill_rect(0.0, top, w, keyboard_height(t), panel);
     let (pad, gx, gy, kh) = (m.dp(KEYBOARD_PAD_X_DP), m.dp(2.0), m.dp(4.0) * scale, m.dp(KEY_H_DP) * scale);
     let cell = (w - pad * 2.0 - gx * 11.0) / 12.0;
+    let unit = cell + gx;
     let row_top = |row: usize| top + m.dp(KEYBOARD_TOP_DP) * scale + row as f32 * (kh + gy);
-    let mut key_rows = Vec::with_capacity(4);
-    let [first, second, third] = rows(layer);
-    let mut one = vec![Cap::Special(SpecialKey::Esc), Cap::Special(SpecialKey::Up)];
-    one.extend(first.chars().map(Cap::Char));
-    key_rows.push((one, false));
-    let mut two = vec![Cap::Special(SpecialKey::Left), Cap::Hide, Cap::Special(SpecialKey::Right)];
-    two.extend(second.chars().map(Cap::Char));
-    key_rows.push((two, false));
-    let mut three = vec![Cap::Special(SpecialKey::Down)];
-    three.extend(third.chars().map(Cap::Char));
-    three.extend([Cap::Backspace, Cap::Special(SpecialKey::Delete), Cap::Special(SpecialKey::Tab)]);
-    key_rows.push((three, false));
-    let switch = match layer {
-        Layer::Letters | Layer::Shifted => Cap::Show(Layer::Digits),
-        Layer::Digits => Cap::Show(Layer::Symbols),
-        Layer::Symbols => Cap::Show(Layer::Digits),
-    };
-    key_rows.push((vec![switch, Cap::Char(','), Cap::Space, Cap::Char('.'), Cap::Meta, Cap::Enter], true));
-
-    let mut keys = Vec::new();
-    for (row, (caps, weighted)) in key_rows.into_iter().enumerate() {
-        if weighted {
-            let weights = [1.15, 0.9, 3.8, 0.9, 1.35, 1.9];
-            let unit = (w - pad * 2.0 - gx * (caps.len() - 1) as f32) / weights.iter().sum::<f32>();
-            let total = weights.iter().sum::<f32>() * unit + gx * (caps.len() - 1) as f32;
-            let mut x = (w - total) / 2.0;
-            for (cap, weight) in caps.into_iter().zip(weights) {
-                let width = unit * weight;
-                keys.push((Rect::new(x, row_top(row), width, kh), cap));
-                x += width + gx;
+    let mut key_rows: [Vec<(usize, usize, Cap)>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut add = |row: usize, col: usize, span: usize, cap| key_rows[row].push((col, span, cap));
+    match layer {
+        Layer::Letters | Layer::Shifted => {
+            let [first, second, third] = rows(layer);
+            add(0, 0, 1, Cap::Special(SpecialKey::Esc));
+            add(0, 1, 1, Cap::Special(SpecialKey::Up));
+            for (i, ch) in first.chars().enumerate() { add(0, i + 2, 1, Cap::Char(ch)); }
+            add(1, 0, 1, Cap::Special(SpecialKey::Left));
+            add(1, 1, 1, Cap::Hide);
+            for (i, ch) in second.chars().enumerate() { add(1, i + 2, 1, Cap::Char(ch)); }
+            add(1, 11, 1, Cap::Special(SpecialKey::Right));
+            add(2, 0, 1, Cap::Special(SpecialKey::Down));
+            add(2, 1, 1, Cap::Shift);
+            for (i, ch) in third.chars().enumerate() { add(2, i + 2, 1, Cap::Char(ch)); }
+            add(2, 9, 1, Cap::Backspace);
+            add(2, 10, 1, Cap::Special(SpecialKey::Delete));
+            add(2, 11, 1, Cap::Special(SpecialKey::Tab));
+        }
+        Layer::Digits => {
+            let [first, second, third] = rows(layer);
+            add(0, 0, 1, Cap::Special(SpecialKey::Esc));
+            add(0, 1, 1, Cap::Special(SpecialKey::Up));
+            for (i, ch) in first.chars().enumerate() { add(0, i + 2, 1, Cap::Char(ch)); }
+            add(1, 0, 1, Cap::Special(SpecialKey::Left));
+            add(1, 1, 1, Cap::Hide);
+            for (i, ch) in second.chars().take(9).enumerate() { add(1, i + 2, 1, Cap::Char(ch)); }
+            add(1, 11, 1, Cap::Special(SpecialKey::Right));
+            add(2, 0, 1, Cap::Special(SpecialKey::Down));
+            add(2, 1, 1, Cap::Shift);
+            let extra = second.chars().skip(9).chain(third.chars()).chain(std::iter::once(':'));
+            for (i, ch) in extra.enumerate() { add(2, i + 2, 1, Cap::Char(ch)); }
+            add(2, 9, 1, Cap::Backspace);
+            add(2, 10, 1, Cap::Special(SpecialKey::Delete));
+            add(2, 11, 1, Cap::Special(SpecialKey::Tab));
+        }
+        Layer::Symbols => {
+            let functions = [
+                SpecialKey::F1, SpecialKey::F2, SpecialKey::F3, SpecialKey::F4,
+                SpecialKey::F5, SpecialKey::F6, SpecialKey::F7, SpecialKey::F8,
+                SpecialKey::F9, SpecialKey::F10, SpecialKey::F11, SpecialKey::F12,
+            ];
+            for (col, key) in functions.into_iter().enumerate() { add(0, col, 1, Cap::Special(key)); }
+            for (col, key) in [SpecialKey::Home, SpecialKey::End, SpecialKey::PageUp, SpecialKey::PageDown, SpecialKey::Insert, SpecialKey::PrintScreen].into_iter().enumerate() {
+                add(1, col, 1, Cap::Special(key));
             }
-        } else {
-            let count = caps.len();
-            let total = count as f32 * cell + (count.saturating_sub(1)) as f32 * gx;
-            let mut x = (w - total) / 2.0;
-            for cap in caps {
-                keys.push((Rect::new(x, row_top(row), cell, kh), cap));
-                x += cell + gx;
-            }
+            for (i, ch) in "[]{}#%".chars().enumerate() { add(1, i + 6, 1, Cap::Char(ch)); }
+            add(2, 0, 1, Cap::Shift);
+            for (i, ch) in "^*+=_\\|~<>".chars().enumerate() { add(2, i + 1, 1, Cap::Char(ch)); }
+            add(2, 11, 1, Cap::Backspace);
         }
     }
+    let (first_switch, second_switch) = match layer {
+        Layer::Letters | Layer::Shifted => (Cap::Show(Layer::Digits), Cap::Show(Layer::Symbols)),
+        Layer::Digits => (Cap::Show(Layer::Letters), Cap::Show(Layer::Symbols)),
+        Layer::Symbols => (Cap::Show(Layer::Letters), Cap::Show(Layer::Digits)),
+    };
+    if layer == Layer::Symbols {
+        add(3, 0, 1, first_switch);
+        add(3, 1, 1, second_switch);
+        add(3, 2, 1, Cap::Char(','));
+        add(3, 3, 1, Cap::Modifier(ModifierKey::Fn));
+        add(3, 4, 1, Cap::Modifier(ModifierKey::Alt));
+        add(3, 5, 2, Cap::Space);
+        add(3, 7, 1, Cap::Modifier(ModifierKey::Ctrl));
+        add(3, 8, 1, Cap::Char('.'));
+        add(3, 9, 1, Cap::Hide);
+        add(3, 10, 1, Cap::Char('`'));
+        add(3, 11, 1, Cap::Enter);
+    } else {
+        add(3, 0, 1, first_switch);
+        add(3, 1, 1, second_switch);
+        add(3, 2, 1, Cap::Char(','));
+        add(3, 3, 1, Cap::Modifier(ModifierKey::Fn));
+        add(3, 4, 1, Cap::Modifier(ModifierKey::Alt));
+        add(3, 5, 3, Cap::Space);
+        add(3, 8, 1, Cap::Modifier(ModifierKey::Ctrl));
+        add(3, 9, 1, Cap::Char('.'));
+        add(3, 10, 1, Cap::Meta);
+        add(3, 11, 1, Cap::Enter);
+    }
+    drop(add);
 
+    let mut keys = Vec::new();
+    for (row, caps) in key_rows.into_iter().enumerate() {
+        for (col, span, cap) in caps {
+            keys.push((Rect::new(pad + col as f32 * unit, row_top(row), span as f32 * unit - gx, kh), cap));
+        }
+    }
     let radius = m.dp(KEY_RADIUS_DP) * scale;
     let glyph_px = m.dp(15.0) * scale;
     for &(r, cap) in &keys {
         let plain = matches!(cap, Cap::Char(_) | Cap::Space);
-        let base = match cap {
-            Cap::Enter => t.pal.accent,
-            Cap::Shift if layer == Layer::Shifted => key,
-            _ if plain => key,
-            _ => side,
-        };
+        let base = match cap { Cap::Enter => t.pal.accent, Cap::Shift if layer == Layer::Shifted => key, _ if plain => key, _ => side };
         let fill = if pressed == Some(cap) { mix(base, ink, 0.16) } else { base };
-        if !t.dark {
-            c.fill_round_rect(r.x, r.y + scale, r.w, r.h, radius, shadow.with_alpha(110));
-        }
+        if !t.dark { c.fill_round_rect(r.x, r.y + scale, r.w, r.h, radius, shadow.with_alpha(110)); }
         c.fill_round_rect(r.x, r.y, r.w, r.h, radius, fill);
         let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
         match cap {
@@ -1038,48 +1079,52 @@ fn cover_keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer
                 c.text_center(&f.body, &label.to_string(), cx, cy, glyph_px, ink);
             }
             Cap::Space => c.text_center(&f.body, l.pick(["空格", "空格", "Space"]), cx, cy, glyph_px, ink),
-            Cap::Enter => c.text_center(&f.body, enter, cx, cy, glyph_px, Rgba::rgb(255, 255, 255)),
+            Cap::Enter => c.text_center(&f.body, enter, cx, cy, glyph_px, ink),
             Cap::Show(Layer::Digits) => c.text_center(&f.body, "123", cx, cy, glyph_px, ink),
             Cap::Show(Layer::Symbols) => c.text_center(&f.body, "#+=", cx, cy, glyph_px, ink),
-            Cap::Show(_) => c.text_center(&f.body, "abc", cx, cy, glyph_px, ink),
+            Cap::Show(_) => c.text_center(&f.body, "ABC", cx, cy, glyph_px, ink),
             Cap::Special(key) => {
                 let label = match key {
-                    SpecialKey::Esc => "Esc",
-                    SpecialKey::Left => "←",
-                    SpecialKey::Up => "↑",
-                    SpecialKey::Down => "↓",
-                    SpecialKey::Right => "→",
-                    SpecialKey::Tab => "Tab",
-                    SpecialKey::Delete => "Del",
+                    SpecialKey::Esc => "Esc", SpecialKey::Left => "←", SpecialKey::Up => "↑", SpecialKey::Down => "↓", SpecialKey::Right => "→",
+                    SpecialKey::Tab => "Tab", SpecialKey::Delete => "Del", SpecialKey::F1 => "F1", SpecialKey::F2 => "F2", SpecialKey::F3 => "F3",
+                    SpecialKey::F4 => "F4", SpecialKey::F5 => "F5", SpecialKey::F6 => "F6", SpecialKey::F7 => "F7", SpecialKey::F8 => "F8",
+                    SpecialKey::F9 => "F9", SpecialKey::F10 => "F10", SpecialKey::F11 => "F11", SpecialKey::F12 => "F12", SpecialKey::Home => "Home",
+                    SpecialKey::End => "End", SpecialKey::PageUp => "PgUp", SpecialKey::PageDown => "PgDn", SpecialKey::Insert => "Ins", SpecialKey::PrintScreen => "PrtSc",
                 };
                 c.text_center(&f.body, label, cx, cy, glyph_px, ink);
             }
-            Cap::Hide => c.text_center(&f.body, "隐", cx, cy, glyph_px, ink),
-            Cap::Meta => c.text_center(&f.body, "Meta", cx, cy, glyph_px, ink),
+            Cap::Hide => draw_keyboard_glyph(c, cx, cy, m.dp(15.0) * scale, m.dp(1.2) * scale, ink),
             Cap::Modifier(key) => {
-                let label = match key {
-                    ModifierKey::Shift => "Shift",
-                    ModifierKey::Fn => "Fn",
-                    ModifierKey::Alt => "Alt",
-                    ModifierKey::Ctrl => "Ctrl",
-                };
+                let label = match key { ModifierKey::Shift => "Shift", ModifierKey::Fn => "Fn", ModifierKey::Alt => "Alt", ModifierKey::Ctrl => "Ctrl" };
                 c.text_center(&f.body, label, cx, cy, glyph_px, ink);
             }
             Cap::Backspace => {
                 let (hw, hh) = (m.dp(7.0) * scale, m.dp(5.0) * scale);
                 let pts = [(cx - hw, cy), (cx - hw * 0.45, cy - hh), (cx + hw, cy - hh), (cx + hw, cy + hh), (cx - hw * 0.45, cy + hh)];
-                for k in 0..pts.len() {
-                    let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
-                    c.line(a.0, a.1, b.0, b.1, m.dp(1.2) * scale, ink);
-                }
+                for k in 0..pts.len() { let (a, b) = (pts[k], pts[(k + 1) % pts.len()]); c.line(a.0, a.1, b.0, b.1, m.dp(1.2) * scale, ink); }
                 c.line(cx - scale, cy - scale, cx + scale, cy + scale, m.dp(1.2) * scale, ink);
                 c.line(cx - scale, cy + scale, cx + scale, cy - scale, m.dp(1.2) * scale, ink);
             }
-            Cap::Shift => {}
+            Cap::Shift => {
+                let s = m.dp(6.0) * scale;
+                let pts = [(cx, cy - s), (cx + s, cy), (cx + s * 0.42, cy), (cx + s * 0.42, cy + s * 0.8), (cx - s * 0.42, cy + s * 0.8), (cx - s * 0.42, cy), (cx - s, cy)];
+                for k in 0..pts.len() { let (a, b) = (pts[k], pts[(k + 1) % pts.len()]); c.line(a.0, a.1, b.0, b.1, m.dp(1.2) * scale, ink); }
+            }
+            Cap::Meta => c.text_center(&f.body, "Meta", cx, cy, glyph_px, ink),
         }
     }
     let touch_y = m.dp(KEY_GAP_Y_DP) * scale;
     keys.into_iter().map(|(r, cap)| (Rect::new(r.x - gx / 2.0, r.y - touch_y / 2.0, r.w + gx, r.h + touch_y), cap)).collect()
+}
+
+fn draw_keyboard_glyph(c: &mut Canvas, cx: f32, cy: f32, size: f32, stroke: f32, ink: Rgba) {
+    let (left, right, top, bottom) = (cx - size, cx + size, cy - size * 0.58, cy + size * 0.58);
+    c.line(left, top, right, top, stroke, ink);
+    c.line(left, top, left, bottom, stroke, ink);
+    c.line(right, top, right, bottom, stroke, ink);
+    c.line(left, bottom, right, bottom, stroke, ink);
+    for i in -2..=2 { let x = cx + i as f32 * size * 0.34; c.line(x, cy - size * 0.22, x, cy - size * 0.08, stroke, ink); }
+    c.line(cx - size * 0.32, cy + size * 0.27, cx + size * 0.32, cy + size * 0.27, stroke, ink);
 }
 
 /// A text field's cursor: the stretch of the field it stands in, drawn
@@ -2715,6 +2760,8 @@ pub enum SpecialKey {
     Right,
     Tab,
     Delete,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    Home, End, PageUp, PageDown, Insert, PrintScreen,
 }
 
 /// A key of the on-screen keyboard.
@@ -2889,7 +2936,11 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
                     SpecialKey::Down => "↓",
                     SpecialKey::Right => "→",
                     SpecialKey::Tab => "Tab",
-                    SpecialKey::Delete => "Del",
+                    SpecialKey::Delete => "Del", SpecialKey::F1 => "F1", SpecialKey::F2 => "F2", SpecialKey::F3 => "F3",
+                    SpecialKey::F4 => "F4", SpecialKey::F5 => "F5", SpecialKey::F6 => "F6", SpecialKey::F7 => "F7", SpecialKey::F8 => "F8",
+                    SpecialKey::F9 => "F9", SpecialKey::F10 => "F10", SpecialKey::F11 => "F11", SpecialKey::F12 => "F12",
+                    SpecialKey::Home => "Home", SpecialKey::End => "End", SpecialKey::PageUp => "PgUp", SpecialKey::PageDown => "PgDn",
+                    SpecialKey::Insert => "Ins", SpecialKey::PrintScreen => "PrtSc",
                 };
                 c.text_center(&f.body, label, cx, cy, m.sub_px, ink);
             }
@@ -2968,39 +3019,104 @@ mod tests {
     }
 
     #[test]
-    fn cover_keyboard_keeps_the_requested_navigation_keys_and_bottom_row_on_every_symbol_layer() {
+    fn cover_digits_have_a_direct_abc_return_key() {
         let f = crate::font::bundled();
-        let mut t = Theme::light(809, 1392, 520.0 / 160.0);
+        let mut t = Theme::light(1208, 1392, 520.0 / 160.0);
         t.m.cover_keyboard = true;
-        t.m.keyboard_scale_y = 0.37;
-        let required = [
-            Cap::Special(SpecialKey::Esc),
-            Cap::Special(SpecialKey::Up),
-            Cap::Special(SpecialKey::Left),
-            Cap::Hide,
-            Cap::Special(SpecialKey::Right),
-            Cap::Special(SpecialKey::Down),
-            Cap::Backspace,
-            Cap::Special(SpecialKey::Delete),
-            Cap::Special(SpecialKey::Tab),
-        ];
+        t.m.keyboard_scale_y = 0.8;
+        let mut canvas = Canvas::new(1208, keyboard_height(&t).ceil() as u32);
+        let keys = keyboard(&mut canvas, &t, &f, Lang::En, 0.0, Layer::Digits, None, "Enter");
+        assert!(keys.iter().any(|(_, cap)| *cap == Cap::Show(Layer::Letters)), "123 mode must have a direct ABC key");
+        assert!(keys.iter().any(|(_, cap)| *cap == Cap::Show(Layer::Symbols)), "123 mode must also reach #+=");
+    }
+
+    #[test]
+    fn cover_keyboard_places_modifiers_in_four_grid_aligned_rows() {
+        let f = crate::font::bundled();
+        let (w, h) = (1208, 1392);
+        let mut t = Theme::light(w, h, 520.0 / 160.0);
+        t.m.cover_keyboard = true;
+        t.m.keyboard_scale_y = 0.8;
+        let (pad, gap) = (t.m.dp(KEYBOARD_PAD_X_DP), t.m.dp(2.0));
+        let unit = (w as f32 - 2.0 * pad - 11.0 * gap) / 12.0 + gap;
+        let start = pad - gap / 2.0;
         for layer in [Layer::Letters, Layer::Digits, Layer::Symbols] {
-            let mut canvas = Canvas::new(809, keyboard_height(&t).ceil() as u32);
+            let mut canvas = Canvas::new(w, keyboard_height(&t).ceil() as u32);
             let keys = keyboard(&mut canvas, &t, &f, Lang::En, 0.0, layer, None, "Enter");
-            let caps: Vec<_> = keys.iter().map(|(_, cap)| *cap).collect();
-            for cap in required {
-                assert!(caps.contains(&cap), "{layer:?} is missing {cap:?}");
+            let mut tops: Vec<i32> = keys.iter().map(|(r, _)| (r.y * 100.0).round() as i32).collect();
+            tops.sort_unstable();
+            tops.dedup();
+            assert_eq!(tops.len(), 4, "{layer:?} has exactly four rows");
+            for top in tops {
+                let row: Vec<_> = keys.iter().filter(|(r, _)| (r.y * 100.0).round() as i32 == top).collect();
+                let mut spans = 0;
+                for (rect, _) in &row {
+                    let col = (rect.x - start) / unit;
+                    let span = rect.w / unit;
+                    assert!((col - col.round()).abs() < 0.02, "{layer:?} row starts on the shared grid: {rect:?}");
+                    assert!((span - span.round()).abs() < 0.02, "{layer:?} key spans whole grid cells: {rect:?}");
+                    spans += span.round() as i32;
+                }
+                assert_eq!(spans, 12, "{layer:?} row fills twelve aligned columns");
             }
-            for cap in [Cap::Char(','), Cap::Space, Cap::Char('.'), Cap::Meta, Cap::Enter] {
-                assert!(caps.contains(&cap), "{layer:?} does not preserve the bottom row key {cap:?}");
+            let row_y = |cap| keys.iter().find(|(_, key)| *key == cap).map(|(rect, _)| rect.y).expect("required key exists");
+            if layer == Layer::Symbols {
+                assert_eq!(row_y(Cap::Shift), row_y(Cap::Char('^')), "Shift shares the symbol row");
+            } else {
+                assert_eq!(row_y(Cap::Shift), row_y(Cap::Special(SpecialKey::Down)), "Shift shares the Z row");
             }
-            let switch = match layer {
-                Layer::Letters | Layer::Shifted => Cap::Show(Layer::Digits),
-                Layer::Digits => Cap::Show(Layer::Symbols),
-                Layer::Symbols => Cap::Show(Layer::Digits),
-            };
-            assert!(caps.contains(&switch), "{layer:?} has the wrong 123/#+= switch");
+            let bottom = row_y(Cap::Space);
+            for modifier in [ModifierKey::Fn, ModifierKey::Alt, ModifierKey::Ctrl] {
+                assert_eq!(row_y(Cap::Modifier(modifier)), bottom, "{modifier:?} is on the bottom row");
+            }
+            if layer == Layer::Symbols {
+                assert_eq!(row_y(Cap::Hide), bottom, "the symbol layer keeps an icon-only hide key");
+            } else {
+                assert_eq!(row_y(Cap::Meta), bottom, "Meta remains available on the bottom row");
+            }
         }
+    }
+
+    #[test]
+    fn cover_symbols_have_function_keys_and_page_navigation_instead_of_digits() {
+        let f = crate::font::bundled();
+        let mut t = Theme::light(1208, 1392, 520.0 / 160.0);
+        t.m.cover_keyboard = true;
+        t.m.keyboard_scale_y = 0.8;
+        let mut canvas = Canvas::new(1208, keyboard_height(&t).ceil() as u32);
+        let keys = keyboard(&mut canvas, &t, &f, Lang::En, 0.0, Layer::Symbols, None, "Enter");
+        let caps: Vec<_> = keys.iter().map(|(_, cap)| *cap).collect();
+        for function in [SpecialKey::F1, SpecialKey::F2, SpecialKey::F3, SpecialKey::F4, SpecialKey::F5, SpecialKey::F6, SpecialKey::F7, SpecialKey::F8, SpecialKey::F9, SpecialKey::F10, SpecialKey::F11, SpecialKey::F12] {
+            assert!(caps.contains(&Cap::Special(function)), "#+= is missing {function:?}");
+        }
+        for navigation in [SpecialKey::Home, SpecialKey::End, SpecialKey::PageUp, SpecialKey::PageDown, SpecialKey::Insert, SpecialKey::PrintScreen] {
+            assert!(caps.contains(&Cap::Special(navigation)), "#+= is missing {navigation:?}");
+        }
+        for symbol in "[]{}#%^*+=_\\|~<>`".chars() {
+            assert!(caps.contains(&Cap::Char(symbol)), "#+= is missing {symbol}");
+        }
+        assert!(!caps.iter().any(|cap| matches!(cap, Cap::Char('0'..='9'))), "#+= must not repeat the number row");
+    }
+
+    #[test]
+    fn cover_hide_key_draws_a_keyboard_outline_instead_of_a_text_label() {
+        let f = crate::font::bundled();
+        let mut t = Theme::light(1208, 1392, 520.0 / 160.0);
+        t.m.cover_keyboard = true;
+        t.m.keyboard_scale_y = 0.8;
+        let mut canvas = Canvas::new(1208, keyboard_height(&t).ceil() as u32);
+        let keys = keyboard(&mut canvas, &t, &f, Lang::En, 0.0, Layer::Letters, None, "Enter");
+        let rect = keys.iter().find(|(_, cap)| *cap == Cap::Hide).unwrap().0;
+        let cx = (rect.x + rect.w / 2.0).round() as i32;
+        let cy = (rect.y + rect.h / 2.0).round() as i32;
+        let top = (cy as f32 - t.m.dp(7.0)).round() as i32;
+        let ink = (-6..=6).step_by(2).filter(|dx| {
+            let x = (cx as f32 + t.m.dp(*dx as f32)).round() as u32;
+            let y = top as u32;
+            let i = ((y * canvas.w + x) * 4) as usize;
+            canvas.data[i] < 80 && canvas.data[i + 1] < 80 && canvas.data[i + 2] < 80
+        }).count();
+        assert!(ink >= 6, "hide-key glyph has a continuous keyboard top edge, got {ink}/7 dark samples");
     }
 
     #[test]

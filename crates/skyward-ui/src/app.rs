@@ -2797,6 +2797,35 @@ struct CoverRect {
     h: u32,
 }
 
+fn draw_cover_tool_icon(out: &mut Canvas, which: usize, cx: f32, cy: f32, px: f32, ink: Rgba) {
+    let sw = px * 1.7;
+    match which {
+        0 => {
+            out.line(cx + px * 5.0, cy - px * 7.0, cx - px * 3.0, cy, sw, ink);
+            out.line(cx - px * 3.0, cy, cx + px * 5.0, cy + px * 7.0, sw, ink);
+        }
+        1 => {
+            out.line(cx - px * 8.0, cy - px, cx, cy - px * 8.0, sw, ink);
+            out.line(cx, cy - px * 8.0, cx + px * 8.0, cy - px, sw, ink);
+            out.line(cx - px * 5.0, cy - px * 2.0, cx - px * 5.0, cy + px * 7.0, sw, ink);
+            out.line(cx + px * 5.0, cy - px * 2.0, cx + px * 5.0, cy + px * 7.0, sw, ink);
+            out.line(cx - px * 5.0, cy + px * 7.0, cx + px * 5.0, cy + px * 7.0, sw, ink);
+            out.line(cx - px * 1.5, cy + px * 7.0, cx - px * 1.5, cy + px * 2.0, sw, ink);
+            out.line(cx - px * 1.5, cy + px * 2.0, cx + px * 1.5, cy + px * 2.0, sw, ink);
+            out.line(cx + px * 1.5, cy + px * 2.0, cx + px * 1.5, cy + px * 7.0, sw, ink);
+        }
+        _ => {
+            let (left, right, top, bottom) = (cx - px * 8.0, cx + px * 8.0, cy - px * 7.0, cy + px * 6.0);
+            out.line(left, top, right, top, sw, ink);
+            out.line(left, top, left, bottom, sw, ink);
+            out.line(right, top, right, bottom, sw, ink);
+            out.line(left, bottom, right, bottom, sw, ink);
+            for i in -2..=2 { let x = cx + i as f32 * px * 2.4; out.line(x, cy - px * 2.0, x, cy - px * 0.6, px, ink); }
+            out.line(cx - px * 3.0, cy + px * 3.0, cx + px * 3.0, cy + px * 3.0, px, ink);
+        }
+    }
+}
+
 /// Copy a source rectangle to a destination rectangle, scaling only when the
 /// cover-panel keyboard expands from the content column to the full panel.
 fn cover_blit(src: &Canvas, dst: &mut Canvas, source: CoverRect, dest: CoverRect) {
@@ -4358,10 +4387,10 @@ impl App {
         if !self.is_cover || !self.cover_keyboard_requested || self.cover_keyboard_hidden {
             return;
         }
-        let t = self.theme();
+        let t = self.cover_widget_keyboard_theme();
         let Some(keyboard_top) = widgets::keyboard_top(&t) else { return; };
         let enter = self.state.lang.pick(["回车", "回车", "Enter"]);
-        let mut canvas = Canvas::new(self.w, 1);
+        let mut canvas = Canvas::new(t.m.w, 1);
         let keys = widgets::keyboard(&mut canvas, &t, f, self.state.lang, 0.0, self.state.layer, self.state.key_held(), enter);
         let top = keyboard_top.max(0.0) + self.top().1;
         let Some(frame) = self.frame.as_mut() else { return };
@@ -4536,37 +4565,23 @@ impl App {
     fn compose_cover_frame(&self, out: &mut Canvas, cover: &CoverPanel, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
         debug_assert_eq!((out.w, out.h), (cover.full_w, cover.full_h));
         out.fill_rect(0.0, 0.0, cover.full_w as f32, cover.full_h as f32, self.theme().pal.bg);
+        cover_blit(
+            &cover.buffer,
+            out,
+            CoverRect { x: 0, y: 0, w: cover.buffer.w, h: cover.full_h },
+            CoverRect { x: cover.cutout_w, y: 0, w: cover.buffer.w, h: cover.full_h },
+        );
         if let Some(top) = self.cover_keyboard_top() {
+            self.draw_cover_widgets(out, cover, f, info, clock);
             let top = top.floor().clamp(0.0, cover.full_h as f32) as u32;
-            // Keep the content and keyboard at native pixel dimensions in the
-            // right pane; the shorter keyboard leaves more terminal viewport.
-            cover_blit(
-                &cover.buffer,
-                out,
-                CoverRect { x: 0, y: 0, w: cover.buffer.w, h: top },
-                CoverRect { x: cover.cutout_w, y: 0, w: cover.buffer.w, h: top },
-            );
-            cover_blit(
-                &cover.buffer,
-                out,
-                CoverRect { x: 0, y: top, w: cover.buffer.w, h: cover.full_h - top },
-                CoverRect { x: cover.cutout_w, y: top, w: cover.buffer.w, h: cover.full_h - top },
-            );
             let (keyboard, _) = self.cover_widget_keyboard_art(f);
             cover_blit(
                 &keyboard,
                 out,
                 CoverRect { x: 0, y: 0, w: keyboard.w, h: keyboard.h },
-                CoverRect { x: cover.cutout_w, y: top, w: cover.buffer.w, h: cover.full_h - top },
+                CoverRect { x: 0, y: top, w: cover.full_w, h: cover.full_h - top },
             );
-            self.draw_cover_modifier_rail(out, cover, top, f);
         } else {
-            cover_blit(
-                &cover.buffer,
-                out,
-                CoverRect { x: 0, y: 0, w: cover.buffer.w, h: cover.full_h },
-                CoverRect { x: cover.cutout_w, y: 0, w: cover.buffer.w, h: cover.full_h },
-            );
             self.draw_cover_widgets(out, cover, f, info, clock);
         }
         out.dim(self.curtain.level(now));
@@ -4580,7 +4595,7 @@ impl App {
         if !self.cover_keyboard_requested && !has_input {
             return None;
         }
-        widgets::keyboard_top(&self.theme())
+        widgets::keyboard_top(&self.cover_widget_keyboard_theme())
     }
 
     fn cover_widget_keyboard_view(&self, cover: &CoverPanel) -> Rect {
@@ -4595,6 +4610,7 @@ impl App {
 
     fn cover_widget_keyboard_theme(&self) -> Theme {
         let mut theme = self.theme();
+        if let Some(cover) = self.cover.as_ref() { theme.m.w = cover.full_w; }
         theme.m.keyboard_scale_y = self.cover_keyboard_scale_y;
         theme
     }
@@ -4602,56 +4618,10 @@ impl App {
     fn cover_widget_keyboard_art(&self, f: &Fonts) -> (Canvas, Vec<(Rect, Cap)>) {
         let theme = self.cover_widget_keyboard_theme();
         let height = widgets::keyboard_height(&theme).ceil().max(1.0) as u32;
-        let mut canvas = Canvas::new(self.w, height);
+        let mut canvas = Canvas::new(theme.m.w, height);
         let enter = self.state.lang.pick(["回车", "回车", "Enter"]);
         let keys = widgets::keyboard(&mut canvas, &theme, f, self.state.lang, 0.0, self.state.layer, None, enter);
         (canvas, keys)
-    }
-
-    fn cover_modifier_controls(&self, cover: &CoverPanel, keyboard_top: u32) -> [(Rect, ModifierKey); 4] {
-        let w = cover.cutout_w as f32;
-        let full_h = cover.full_h as f32;
-        let top = (keyboard_top as f32).clamp(cover.cutout_h as f32, full_h);
-        let pad = self.px_per_dp * 8.0;
-        let gap = self.px_per_dp * 5.0;
-        let bw = (w - pad * 2.0 - gap).max(0.0) / 2.0;
-        let bh = (full_h - top - pad * 2.0 - gap).max(0.0) / 2.0;
-        let rect = |col: usize, row: usize| {
-            Rect::new(
-                pad + col as f32 * (bw + gap),
-                top + pad + row as f32 * (bh + gap),
-                bw,
-                bh,
-            )
-        };
-        [
-            (rect(0, 0), ModifierKey::Shift),
-            (rect(1, 0), ModifierKey::Fn),
-            (rect(0, 1), ModifierKey::Alt),
-            (rect(1, 1), ModifierKey::Ctrl),
-        ]
-    }
-
-    fn draw_cover_modifier_rail(&self, out: &mut Canvas, cover: &CoverPanel, keyboard_top: u32, f: &Fonts) {
-        let t = self.theme();
-        let w = cover.cutout_w as f32;
-        let panel_top = cover.cutout_h as f32;
-        let full_h = cover.full_h as f32;
-        out.fill_rect(0.0, panel_top, w, full_h - panel_top, t.pal.bg);
-        let controls = self.cover_modifier_controls(cover, keyboard_top);
-        for (i, (rect, modifier)) in controls.into_iter().enumerate() {
-            let label = match modifier {
-                ModifierKey::Shift => "Shift",
-                ModifierKey::Fn => "Fn",
-                ModifierKey::Alt => "Alt",
-                ModifierKey::Ctrl => "Ctrl",
-            };
-            let active = cover.modifier_modes[i] != ModifierMode::Off;
-            let fill = if active { t.pal.accent } else { t.pal.badge };
-            let ink = if active { Rgba::rgb(255, 255, 255) } else { t.pal.text };
-            out.fill_round_rect(rect.x, rect.y, rect.w, rect.h, self.px_per_dp * 8.0, fill);
-            out.text_center(&f.body, label, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, self.px_per_dp * 11.0, ink);
-        }
     }
 
     fn draw_cover_widgets(&self, out: &mut Canvas, cover: &CoverPanel, f: &Fonts, info: &DeviceInfo, clock: &str) {
@@ -4672,33 +4642,36 @@ impl App {
         let title_y = card_y + self.px_per_dp * 25.0;
         let body = t.pal.text;
         let subdued = t.pal.subtitle;
+        let lang = self.state.lang;
         match cover.widget_page {
             0 => {
-                out.text_center(&f.heading, "虚拟按键", cx, title_y, self.px_per_dp * 13.0, body);
-                let labels = ["返回", "主页", "键盘"];
+                out.text_center(&f.heading, lang.pick(["虚拟按键", "虛擬按鍵", "Navigation"]), cx, title_y, self.px_per_dp * 13.0, body);
                 let y = card_y + self.px_per_dp * 76.0;
                 let gap = self.px_per_dp * 3.0;
                 let button_w = (card_w - gap * 4.0) / 3.0;
-                for (i, label) in labels.iter().enumerate() {
+                for i in 0..3 {
                     let x = card_x + gap + i as f32 * (button_w + gap);
                     out.fill_round_rect(x, y, button_w, self.px_per_dp * 45.0, self.px_per_dp * 8.0, t.pal.badge);
-                    out.text_center(&f.body, label, x + button_w / 2.0, y + self.px_per_dp * 22.0, self.px_per_dp * 9.5, body);
+                    draw_cover_tool_icon(out, i, x + button_w / 2.0, y + self.px_per_dp * 22.5, self.px_per_dp, body);
                 }
             }
             1 => {
-                out.text_center(&f.heading, "时间与温度", cx, title_y, self.px_per_dp * 11.0, subdued);
+                out.text_center(&f.heading, lang.pick(["时间与温度", "時間與溫度", "Time & temperature"]), cx, title_y, self.px_per_dp * 11.0, subdued);
                 out.text_center(&f.heading, clock, cx, card_y + self.px_per_dp * 75.0, self.px_per_dp * 21.0, body);
                 let temp = info.battery.as_ref().and_then(|battery| battery.temp).map_or_else(
                     || "--°C".to_string(),
                     |tenths| format!("{}.{:01}°C", tenths.div_euclid(10), tenths.rem_euclid(10)),
                 );
                 out.text_center(&f.body, &temp, cx, card_y + self.px_per_dp * 111.0, self.px_per_dp * 13.0, subdued);
-                let level = info.battery.as_ref().map_or_else(|| "电量 --%".to_string(), |battery| format!("电量 {}%", battery.level));
+                let level = info.battery.as_ref().map_or_else(
+                    || lang.pick(["电量 --%", "電量 --%", "Battery --%"]).to_string(),
+                    |battery| lang.pick([format!("电量 {}%", battery.level), format!("電量 {}%", battery.level), format!("Battery {}%", battery.level)]).to_string(),
+                );
                 out.text_center(&f.body, &level, cx, card_y + self.px_per_dp * 141.0, self.px_per_dp * 9.5, subdued);
             }
             _ => {
-                out.text_center(&f.heading, "虚拟键盘", cx, title_y, self.px_per_dp * 13.0, body);
-                out.text_center(&f.body, "左右滑动查看更多按键", cx, card_y + self.px_per_dp * 43.0, self.px_per_dp * 7.5, subdued);
+                out.text_center(&f.heading, lang.pick(["虚拟键盘", "虛擬鍵盤", "Keyboard"]), cx, title_y, self.px_per_dp * 13.0, body);
+                out.text_center(&f.body, lang.pick(["左右滑动查看更多按键", "左右滑動查看更多按鍵", "Swipe to browse keys"]), cx, card_y + self.px_per_dp * 43.0, self.px_per_dp * 7.5, subdued);
                 let view = self.cover_widget_keyboard_view(cover);
                 let (keyboard, _) = self.cover_widget_keyboard_art(f);
                 let view_w = view.w.floor().max(0.0) as u32;
@@ -4720,7 +4693,7 @@ impl App {
         for (i, dot) in dots.iter().enumerate() {
             out.text_center(&f.body, dot, cx + (i as f32 - 1.0) * pitch, card_y + card_h - self.px_per_dp * 18.0, self.px_per_dp * 5.0, if i == cover.widget_page { t.pal.accent } else { subdued });
         }
-        out.text_center(&f.body, "上下滑动切换", cx, card_y + card_h - self.px_per_dp * 5.0, self.px_per_dp * 7.0, subdued);
+        out.text_center(&f.body, lang.pick(["上下滑动切换", "上下滑動切換", "Swipe up/down to switch"]), cx, card_y + card_h - self.px_per_dp * 5.0, self.px_per_dp * 7.0, subdued);
     }
 
     fn toggle_cover_modifier(&mut self, modifier: ModifierKey, now: u64) {
@@ -4751,14 +4724,7 @@ impl App {
         let Some(cover) = self.cover.as_ref() else { return Vec::new() };
         let page = cover.widget_page;
         let px = self.px_per_dp;
-        if let Some(top) = self.cover_keyboard_top() {
-            let top = top.floor().clamp(0.0, cover.full_h as f32) as u32;
-            let modifier = self.cover_modifier_controls(cover, top).into_iter().find_map(|(rect, modifier)| rect.contains(x, y).then_some(modifier));
-            if let Some(modifier) = modifier {
-                return self.act(Action::Type(Cap::Modifier(modifier)), now);
-            }
-            return Vec::new();
-        }
+        if self.cover_keyboard_top().is_some() { return Vec::new(); }
         let card_top = cover.cutout_h as f32 + px * 8.0;
         let button_top = card_top + px * 76.0;
         if page == 0 && y >= button_top && y < button_top + px * 45.0 {
@@ -6442,7 +6408,12 @@ impl App {
             Cap::Special(SpecialKey::Right) => ed.right(),
             Cap::Special(SpecialKey::Up) => ed.up(),
             Cap::Special(SpecialKey::Down) => ed.down(),
+            Cap::Special(SpecialKey::Home) => ed.home(),
+            Cap::Special(SpecialKey::End) => ed.end(),
+            Cap::Special(SpecialKey::PageUp) => ed.first(),
+            Cap::Special(SpecialKey::PageDown) => ed.last(),
             Cap::Special(SpecialKey::Esc) | Cap::Meta => ed.insert('\x1b'),
+            Cap::Special(SpecialKey::F1 | SpecialKey::F2 | SpecialKey::F3 | SpecialKey::F4 | SpecialKey::F5 | SpecialKey::F6 | SpecialKey::F7 | SpecialKey::F8 | SpecialKey::F9 | SpecialKey::F10 | SpecialKey::F11 | SpecialKey::F12 | SpecialKey::Insert | SpecialKey::PrintScreen) => {},
             Cap::Hide | Cap::Modifier(_) => {}
         }
         if !matches!(cap, Cap::Shift | Cap::Show(_)) {
@@ -6533,8 +6504,7 @@ impl App {
             Cap::Show(layer) => self.state.layer = layer,
             Cap::Special(SpecialKey::Tab) => self.typing().push('\t'),
             Cap::Special(SpecialKey::Delete) => { self.typing().pop(); self.edits += 1; }
-            Cap::Special(SpecialKey::Esc | SpecialKey::Left | SpecialKey::Up | SpecialKey::Down | SpecialKey::Right)
-            | Cap::Hide | Cap::Modifier(_) | Cap::Meta => {}
+            Cap::Special(_) | Cap::Hide | Cap::Modifier(_) | Cap::Meta => {}
             Cap::Enter => match self.screen() {
                 Screen::Search => {
                     if let Some(first) = search::find_on(&self.state.search, l, |screen| self.state.offers(screen)).first() {
@@ -6668,16 +6638,8 @@ impl App {
         if mapped.is_some() {
             match ev {
                 Touch::Down(x, y) => {
-                    if keyboard_top.is_some() {
-                        if x < cover.cutout_w as f32 {
-                            if y >= cover.cutout_h as f32 {
-                                cover.gesture = Some((x, y, x, y));
-                                touched_widget = true;
-                            }
-                            mapped = None;
-                        } else {
-                            mapped = Some(Touch::Down(x - cover.cutout_w as f32, content_y(y)));
-                        }
+                    if keyboard_top.is_some_and(|top| y >= top as f32) {
+                        mapped = Some(Touch::Down(x, content_y(y)));
                     } else if x < cover.cutout_w as f32 {
                         if y >= cover.cutout_h as f32 {
                             cover.gesture = Some((x, y, x, y));
@@ -6689,12 +6651,8 @@ impl App {
                     }
                 }
                 Touch::Move(x, y) => {
-                    if keyboard_top.is_some() {
-                        if x >= cover.cutout_w as f32 {
-                            mapped = Some(Touch::Move(x - cover.cutout_w as f32, content_y(y)));
-                        } else {
-                            mapped = None;
-                        }
+                    if keyboard_top.is_some_and(|top| y >= top as f32) {
+                        mapped = Some(Touch::Move(x, content_y(y)));
                     } else if x >= cover.cutout_w as f32 {
                         mapped = Some(Touch::Move(x - cover.cutout_w as f32, y));
                     } else {
@@ -12574,45 +12532,42 @@ mod tests {
     }
 
     #[test]
-    fn cover_modifier_controls_only_fill_the_keyboard_height_of_the_left_pane() {
+    fn cover_keyboard_paints_over_the_widget_column_and_keeps_camera_cutout_clear() {
         let (f, info) = (fonts(), info());
         let (w, h) = (1208, 1392);
         let mut app = App::new_cover(Screen::Search, w, h, 520.0 / 160.0);
         app.frame(&f, &info);
-        let (cutout_w, cutout_h) = {
-            let cover = app.cover.as_ref().unwrap();
-            (cover.cutout_w, cover.cutout_h)
-        };
-        let top = app.cover_keyboard_top().unwrap();
-        let theme = app.theme();
+        let cover = app.cover.as_ref().unwrap();
+        let (cutout_w, cutout_h) = (cover.cutout_w, cover.cutout_h);
+        let top = app.cover_keyboard_top().unwrap().floor() as u32;
+        let (keyboard, keys) = app.cover_widget_keyboard_art(&f);
+        let (key, _) = keys.iter().find(|(_, cap)| *cap == Cap::Char('q')).copied().unwrap();
+        let x = (key.x + key.w / 2.0).round() as u32;
+        let y = top + (key.y + key.h / 2.0).round() as u32;
+        assert!(x < cutout_w && y > cutout_h, "the key extends into the former widget pane below the camera");
         let mut out = Canvas::new(w, h);
         app.compose(&mut out, &f, &info, "12:00", 20);
-        let pixel = |x: u32, y: u32| {
-            let i = ((y * w + x) * 4) as usize;
-            [out.data[i], out.data[i + 1], out.data[i + 2]]
-        };
-        let x = (theme.m.dp(8.0) + 20.0) as u32;
-        assert_eq!(pixel(x, cutout_h + 60), [theme.pal.bg.r, theme.pal.bg.g, theme.pal.bg.b], "the left pane above the keyboard remains clear");
-        assert_eq!(pixel(x, (top + theme.m.dp(8.0) + 20.0) as u32), [theme.pal.badge.r, theme.pal.badge.g, theme.pal.badge.b], "the modifier rail begins beside the keyboard");
-        assert!(cutout_w > x);
+        let out_at = ((y * w + x) * 4) as usize;
+        let key_at = ((((key.y + key.h / 2.0).round() as u32) * keyboard.w + x) * 4) as usize;
+        assert_eq!(&out.data[out_at..out_at + 4], &keyboard.data[key_at..key_at + 4], "full-width keyboard pixels cover the widget region");
+        let camera_at = ((100 * w + 50) * 4) as usize;
+        let bg = app.theme().pal.bg;
+        assert_eq!(&out.data[camera_at..camera_at + 3], &[bg.r, bg.g, bg.b], "the camera cutout remains clear");
     }
 
     #[test]
-    fn cover_modifier_hit_targets_follow_the_keyboard_band() {
+    fn cover_keyboard_bottom_row_modifier_hits_follow_the_full_width_layout() {
         let (f, info) = (fonts(), info());
         let mut app = App::new_cover(Screen::Search, 1208, 1392, 520.0 / 160.0);
-        app.frame(&f, &info);
-        let (cover, top) = (app.cover.as_ref().unwrap(), app.cover_keyboard_top().unwrap());
-        let (cutout_w, cutout_h, full_h) = (cover.cutout_w, cover.cutout_h, cover.full_h);
-        let pad = app.px_per_dp * 8.0;
-        let x = pad + 20.0;
-        let y = top + pad + 20.0;
-        assert!(x < cutout_w as f32 && y < full_h as f32);
-        app.cover_widget_tap(x, y, 700, &f);
-        let modes = app.cover.as_ref().unwrap().modifier_modes;
-        assert_eq!(modes[0], ModifierMode::OneShot, "the visible upper-left modifier button is Shift");
-        assert_eq!(modes[2], ModifierMode::Off, "the Alt button remains untouched");
-        assert!((cutout_h as f32) < y);
+        let hit = app.frame(&f, &info).hits.iter()
+            .find(|hit| hit.action == Action::Type(Cap::Modifier(ModifierKey::Fn)))
+            .copied().expect("Fn key is present in the keyboard bottom row");
+        let x = hit.rect.x + hit.rect.w / 2.0;
+        let y = hit.rect.y + hit.rect.h / 2.0;
+        assert!(x < app.cover.as_ref().unwrap().cutout_w as f32, "Fn is tappable in the extended widget-area portion");
+        app.touch(Touch::Down(x, y), &f, 10);
+        app.touch(Touch::Up, &f, 20);
+        assert_eq!(app.cover.as_ref().unwrap().modifier_modes[1], ModifierMode::OneShot);
     }
 
     #[test]
@@ -12628,7 +12583,7 @@ mod tests {
         let (mapped, _) = app.cover_touch_event(Touch::Down(w as f32 - 1.0, y), 10, &f);
         let Some(Touch::Down(_, mapped_y)) = mapped else { panic!("keyboard touch was not routed") };
         assert!((mapped_y - y).abs() < 0.01, "keyboard touch y={mapped_y}, expected {y}");
-        let t = app.theme();
+        let t = app.cover_widget_keyboard_theme();
         let natural = Theme::light(w, h, 520.0 / 160.0);
         let mut scaled_canvas = Canvas::new(w, h);
         let scaled_keys = widgets::keyboard(&mut scaled_canvas, &t, &f, Lang::En, top as f32, widgets::Layer::Letters, None, "Enter");
@@ -12911,6 +12866,83 @@ mod tests {
     }
 
     #[test]
+    fn cover_widget_labels_change_with_the_selected_language() {
+        let (f, info) = (fonts(), info());
+        let render = |page, lang| {
+            let mut app = App::new_cover(Screen::Home, 1208, 1392, 520.0 / 160.0);
+            app.state.lang = lang;
+            app.cover.as_mut().unwrap().widget_page = page;
+            let mut out = Canvas::new(1208, 1392);
+            let cover = app.cover.as_ref().unwrap();
+            app.draw_cover_widgets(&mut out, cover, &f, &info, "12:00");
+            out.data.clone()
+        };
+        for page in [0, 1] {
+            let hans = render(page, Lang::Hans);
+            let hant = render(page, Lang::Hant);
+            let en = render(page, Lang::En);
+            assert!(hans != hant, "widget page {page} must distinguish simplified and traditional Chinese");
+            assert!(hant != en, "widget page {page} must translate into English");
+        }
+    }
+
+    #[test]
+    fn cover_keyboard_art_uses_the_widget_area_as_full_width_keyboard_space() {
+        let (f, info) = (fonts(), info());
+        let app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+        let cover = app.cover.as_ref().unwrap();
+        let (keyboard, keys) = app.cover_widget_keyboard_art(&f);
+        assert_eq!(keyboard.w, cover.full_w, "keyboard art extends over the widget pane");
+        assert!(keys.iter().any(|(rect, cap)| rect.x < cover.cutout_w as f32 && matches!(cap, Cap::Char('q'))));
+        let _ = info;
+    }
+
+    #[test]
+    fn a_keyboard_key_touched_in_the_widget_pane_reaches_the_terminal() {
+        let (f, info) = (fonts(), info());
+        let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+        app.term = Some(Term::new(24, 80));
+        app.cover_keyboard_requested = true;
+        let hit = app.frame(&f, &info).hits.iter()
+            .find(|hit| hit.action == Action::Type(Cap::Special(SpecialKey::Esc)))
+            .copied()
+            .unwrap();
+        let cover = app.cover.as_ref().unwrap();
+        let x = hit.rect.x + hit.rect.w / 2.0;
+        let y = hit.rect.y + hit.rect.h / 2.0;
+        assert!(x < cover.cutout_w as f32, "the keyboard extends into the old widget pane");
+        app.touch(Touch::Down(x, y), &f, 10);
+        assert_eq!(app.touch(Touch::Up, &f, 20), vec![Effect::TermInput(vec![0x1b])]);
+    }
+
+    #[test]
+    fn cover_widget_toolbar_buttons_draw_home_and_keyboard_icons() {
+        let (f, info) = (fonts(), info());
+        let app = App::new_cover(Screen::Home, 1208, 1392, 520.0 / 160.0);
+        let cover = app.cover.as_ref().unwrap();
+        let t = app.theme();
+        let mut out = Canvas::new(cover.full_w, cover.full_h);
+        app.draw_cover_widgets(&mut out, cover, &f, &info, "12:00");
+        let pad = app.px_per_dp * 10.0;
+        let card_y = cover.cutout_h as f32 + app.px_per_dp * 4.0;
+        let card_w = cover.cutout_w as f32 - pad * 2.0;
+        let gap = app.px_per_dp * 3.0;
+        let button_w = (card_w - gap * 4.0) / 3.0;
+        let button_y = card_y + app.px_per_dp * 76.0;
+        let pixel_is_ink = |x: f32, y: f32| {
+            let x = x.round().clamp(0.0, out.w as f32 - 1.0) as u32;
+            let y = y.round().clamp(0.0, out.h as f32 - 1.0) as u32;
+            let i = ((y * out.w + x) * 4) as usize;
+            out.data[i] < 100 && out.data[i + 1] < 100 && out.data[i + 2] < 100
+        };
+        let home_x = pad + gap + (button_w + gap) + button_w / 2.0;
+        let keyboard_x = pad + gap + 2.0 * (button_w + gap) + button_w / 2.0;
+        let center_y = button_y + app.px_per_dp * 22.5;
+        assert!(pixel_is_ink(home_x, center_y - t.m.dp(8.0)), "home button has the house-roof apex, not a text label");
+        assert!(pixel_is_ink(keyboard_x, center_y - t.m.dp(7.0)), "keyboard button has the keyboard top edge, not a text label");
+    }
+
+    #[test]
     fn the_cover_keyboard_widget_opens_an_overlay_without_leaving_the_current_screen() {
         let (f, info) = (fonts(), info());
         let mut app = App::new_cover(Screen::Home, 1208, 1392, 520.0 / 160.0);
@@ -12921,35 +12953,19 @@ mod tests {
         app.cover_widget_tap(x, y, 10, &f);
         assert_eq!(app.screen(), Screen::Home, "keyboard button must not navigate away");
         let top = app.cover_keyboard_top().expect("keyboard overlay must open on a page without text fields").floor() as u32;
-        let has_keyboard_hits = app.frame(&f, &info).hits.iter().any(|hit| matches!(hit.action, Action::Type(_)));
-        assert!(has_keyboard_hits, "opened overlay keys must be tappable");
+        assert!(app.frame(&f, &info).hits.iter().any(|hit| matches!(hit.action, Action::Type(_))), "opened overlay keys must be tappable");
         let mut out = Canvas::new(1208, 1392);
         app.compose(&mut out, &f, &info, "12:00", 20);
-        let cutout_w = app.cover.as_ref().unwrap().cutout_w;
         let (keyboard, keys) = app.cover_widget_keyboard_art(&f);
         let key = keys.iter().find(|(_, cap)| *cap == Cap::Char('q')).expect("keyboard contains Q").0;
-        let cover = app.cover.as_ref().unwrap();
-        let mut sample = None;
-        for dy in 0..key.h.ceil() as u32 {
-            for dx in 0..key.w.ceil() as u32 {
-                let (key_x, key_y) = (key.x.floor() as u32 + dx, key.y.floor() as u32 + dy);
-                if key_x >= keyboard.w || key_y >= keyboard.h { continue; }
-                let keyboard_at = ((key_y * keyboard.w + key_x) * 4) as usize;
-                let page_at = (((top + key_y) * cover.buffer.w + key_x) * 4) as usize;
-                if keyboard.data[keyboard_at..keyboard_at + 4] != cover.buffer.data[page_at..page_at + 4] {
-                    sample = Some((key_x, key_y, keyboard_at));
-                    break;
-                }
-            }
-            if sample.is_some() { break; }
-        }
-        let (key_x, key_y, keyboard_at) = sample.expect("Q key has visible pixels over the underlying page");
-        let output_at = (((top + key_y) * out.w + cutout_w + key_x) * 4) as usize;
-        assert_eq!(
-            &out.data[output_at..output_at + 4],
-            &keyboard.data[keyboard_at..keyboard_at + 4],
-            "a non-input page's overlay must paint the actual key, not only make it tappable",
-        );
+        let x = (key.x + key.w / 2.0).round() as u32;
+        let y = (key.y + key.h / 2.0).round() as u32;
+        assert!(x < app.cover.as_ref().unwrap().cutout_w, "Q key overlays the old widget column");
+        let dest_h = 1392 - top;
+        let source_y = (y as u64 * keyboard.h as u64 / dest_h as u64) as u32;
+        let output_at = (((top + y) * out.w + x) * 4) as usize;
+        let keyboard_at = ((source_y * keyboard.w + x) * 4) as usize;
+        assert_eq!(&out.data[output_at..output_at + 4], &keyboard.data[keyboard_at..keyboard_at + 4], "keyboard paints over the widget pane");
     }
 
     #[test]
@@ -13067,10 +13083,7 @@ mod tests {
         let mut app = App::new_cover(Screen::Search, width, height, 520.0 / 160.0);
         let mut out = Canvas::new(width, height);
         app.compose(&mut out, &f, &i, "12:00", 0);
-        let (cutout_w, cutout_h) = {
-            let cover = app.cover.as_ref().unwrap();
-            (cover.cutout_w, cover.cutout_h)
-        };
+        let cutout_h = app.cover.as_ref().unwrap().cutout_h;
         let top = app.cover_keyboard_top().expect("search has a software keyboard").floor() as u32;
         let bg = app.theme().pal.bg;
         assert_eq!(&out.data[((100 * width + 100) * 4) as usize..][..3], &[bg.r, bg.g, bg.b], "keyboard composition leaves the camera area in the menu background");
@@ -13079,8 +13092,8 @@ mod tests {
         let target_y = top as f32 + 20.0;
         let (mapped, _) = app.cover_touch_event(Touch::Down(width as f32 - 1.0, target_y), 10, &f);
         let Some(Touch::Down(x, y)) = mapped else { panic!("keyboard touch was not routed") };
-        let expected_x = (width - 1 - cutout_w) as f32;
-        assert!((x - expected_x).abs() < 0.01, "mapped keyboard x={x}, expected {expected_x}");
+        let expected_x = (width - 1) as f32;
+        assert!((x - expected_x).abs() < 0.01, "full-width keyboard touch x={x}, expected {expected_x}");
         assert!((y - target_y).abs() < 0.01, "mapped keyboard y={y}, expected {target_y}");
     }
 }
