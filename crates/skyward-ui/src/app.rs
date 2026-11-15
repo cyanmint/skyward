@@ -12667,6 +12667,102 @@ mod tests {
     }
 
     #[test]
+    fn cover_keyboard_control_taps_follow_their_displayed_labels() {
+        let (f, info) = (fonts(), info());
+        let new_app = |layer| {
+            let mut app = App::new_cover(Screen::Search, 1208, 1392, 520.0 / 160.0);
+            app.state.layer = layer;
+            app.cover_keyboard_requested = true;
+            app
+        };
+        let tap = |app: &mut App, cap: Cap, now: u64| {
+            let rect = app
+                .frame(&f, &info)
+                .hits
+                .iter()
+                .find(|hit| hit.action == Action::Type(cap))
+                .unwrap_or_else(|| panic!("visible {cap:?} key has a hit target"))
+                .rect;
+            let (x, y) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+            app.touch(Touch::Down(x, y), &f, now);
+            app.touch(Touch::Up, &f, now + 1);
+        };
+
+        for (from, key, to) in [
+            (Layer::Letters, Cap::Show(Layer::Digits), Layer::Digits),
+            (Layer::Letters, Cap::Show(Layer::Symbols), Layer::Symbols),
+            (Layer::Shifted, Cap::Show(Layer::Digits), Layer::Digits),
+            (Layer::Shifted, Cap::Show(Layer::Symbols), Layer::Symbols),
+            (Layer::Digits, Cap::Show(Layer::Letters), Layer::Letters),
+            (Layer::Digits, Cap::Show(Layer::Symbols), Layer::Symbols),
+            (Layer::Symbols, Cap::Show(Layer::Letters), Layer::Letters),
+            (Layer::Symbols, Cap::Show(Layer::Digits), Layer::Digits),
+        ] {
+            let mut app = new_app(from);
+            let (_, keys) = app.cover_widget_keyboard_art(&f);
+            assert!(
+                keys.iter().any(|(_, visible)| *visible == key),
+                "{from:?} displays {key:?}"
+            );
+            tap(&mut app, key, 10);
+            assert_eq!(
+                app.state.layer, to,
+                "{from:?} key {key:?} must select {to:?}"
+            );
+        }
+
+        for (from, to) in [
+            (Layer::Letters, Layer::Shifted),
+            (Layer::Shifted, Layer::Letters),
+            (Layer::Digits, Layer::Shifted),
+            (Layer::Symbols, Layer::Shifted),
+        ] {
+            let mut app = new_app(from);
+            tap(&mut app, Cap::Shift, 20);
+            assert_eq!(app.state.layer, to, "{from:?} shift key must select {to:?}");
+        }
+
+        for layer in [
+            Layer::Letters,
+            Layer::Shifted,
+            Layer::Digits,
+            Layer::Symbols,
+        ] {
+            let mut app = new_app(layer);
+            for (modifier, index) in [
+                (ModifierKey::Fn, 1),
+                (ModifierKey::Alt, 2),
+                (ModifierKey::Ctrl, 3),
+            ] {
+                let cap = Cap::Modifier(modifier);
+                let (_, keys) = app.cover_widget_keyboard_art(&f);
+                assert!(
+                    keys.iter().any(|(_, visible)| *visible == cap),
+                    "{layer:?} displays {modifier:?}"
+                );
+                tap(&mut app, cap, 30 + index as u64 * 2);
+                assert_eq!(
+                    app.cover.as_ref().unwrap().modifier_modes[index],
+                    ModifierMode::OneShot,
+                    "tapping {modifier:?} must activate that modifier"
+                );
+                app.cover.as_mut().unwrap().modifier_modes[index] = ModifierMode::Off;
+            }
+            let (_, keys) = app.cover_widget_keyboard_art(&f);
+            assert!(
+                keys.iter().any(|(_, visible)| *visible == Cap::Hide),
+                "{layer:?} displays the hide-key icon"
+            );
+            tap(&mut app, Cap::Hide, 50);
+            assert_eq!(
+                app.cover_keyboard_top(),
+                None,
+                "{layer:?} hide-key tap must dismiss the keyboard"
+            );
+        }
+    }
+
+    #[test]
     fn cover_keyboard_paints_over_the_widget_column_and_keeps_camera_cutout_clear() {
         let (f, info) = (fonts(), info());
         let (w, h) = (1208, 1392);
