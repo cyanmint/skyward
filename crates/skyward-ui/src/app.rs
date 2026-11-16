@@ -6756,7 +6756,7 @@ impl App {
                 let edge_width = self
                     .cover_keyboard_top()
                     .filter(|top| y >= *top)
-                    .and_then(|_| self.cover_full_w)
+                    .and(self.cover_full_w)
                     .unwrap_or(m.w);
                 let side = if x < edge {
                     Some(true)
