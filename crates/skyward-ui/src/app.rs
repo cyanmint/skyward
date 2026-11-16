@@ -2740,6 +2740,8 @@ pub struct App {
     px_per_dp: f32,
     /// The cover keyboard fit remains available while its render buffer is detached.
     cover_keyboard_scale_y: f32,
+    /// The panel width stays stable while the cover render buffer is detached.
+    cover_full_w: Option<u32>,
     is_cover: bool,
     cover_keyboard_hidden: bool,
     cover_keyboard_requested: bool,
@@ -2929,6 +2931,7 @@ impl App {
             h,
             px_per_dp,
             cover_keyboard_scale_y: 1.0,
+            cover_full_w: None,
             is_cover: false,
             cover_keyboard_hidden: false,
             cover_keyboard_requested: false,
@@ -2949,6 +2952,7 @@ impl App {
         keyboard_theme.m.w = full_w;
         keyboard_theme.m.keyboard_scale_y = 1.0;
         app.cover_keyboard_scale_y = widgets::cover_keyboard_scale(&keyboard_theme, (full_h - cutout_h) as f32);
+        app.cover_full_w = Some(full_w);
         app.cover = Some(CoverPanel {
             full_w,
             full_h,
@@ -4637,7 +4641,7 @@ impl App {
 
     fn cover_widget_keyboard_theme(&self) -> Theme {
         let mut theme = self.theme();
-        if let Some(cover) = self.cover.as_ref() { theme.m.w = cover.full_w; }
+        if let Some(full_w) = self.cover_full_w { theme.m.w = full_w; }
         theme.m.keyboard_scale_y = self.cover_keyboard_scale_y;
         theme
     }
@@ -6752,7 +6756,7 @@ impl App {
                 let edge_width = self
                     .cover_keyboard_top()
                     .filter(|top| y >= *top)
-                    .and_then(|_| self.cover.as_ref().map(|cover| cover.full_w))
+                    .and_then(|_| self.cover_full_w)
                     .unwrap_or(m.w);
                 let side = if x < edge {
                     Some(true)
@@ -12642,6 +12646,31 @@ mod tests {
             vec![Effect::TermInput(b"q".to_vec())],
             "the bottom edge of Q must not type the A below it"
         );
+    }
+
+    #[test]
+    fn cover_composition_detachment_preserves_keyboard_hit_geometry() {
+        let (f, info) = (fonts(), info());
+        let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+        app.term = Some(term::Term::new(24, 60));
+        app.frame(&f, &info);
+        let (_, keys) = app.cover_widget_keyboard_art(&f);
+        let top = app.cover_keyboard_top().unwrap();
+        let row: Vec<_> = "qwertyuiop"
+            .chars()
+            .map(|ch| {
+                let rect = keys.iter().find(|(_, cap)| *cap == Cap::Char(ch)).unwrap().0;
+                (ch, rect.x + rect.w / 2.0, top + rect.y + rect.h / 2.0)
+            })
+            .collect();
+        let mut out = Canvas::new(1208, 1392);
+        for (index, (ch, x, y)) in row.into_iter().enumerate() {
+            app.compose(&mut out, &f, &info, "12:00", 10 + index as u64 * 2);
+            let now = 100 + index as u64 * 2;
+            let mut effects = app.touch(Touch::Down(x, y), &f, now);
+            effects.extend(app.touch(Touch::Up, &f, now + 1));
+            assert_eq!(effects, vec![Effect::TermInput(vec![ch as u8])], "visible key {ch:?}");
+        }
     }
 
     #[test]
