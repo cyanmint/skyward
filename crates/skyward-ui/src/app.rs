@@ -4386,11 +4386,11 @@ impl App {
     /// They are placed in page coordinates by adding the current scroll, so
     /// the fixed overlay remains tappable while the underlying page moves.
     fn sync_cover_keyboard_hits(&mut self, f: &Fonts) {
-        if !self.is_cover || !self.cover_keyboard_requested || self.cover_keyboard_hidden {
+        if self.cover_keyboard_hidden {
             return;
         }
+        let Some(keyboard_top) = self.cover_keyboard_top() else { return; };
         let t = self.cover_widget_keyboard_theme();
-        let Some(keyboard_top) = widgets::keyboard_top(&t) else { return; };
         let enter = self.state.lang.pick(["回车", "回车", "Enter"]);
         let mut canvas = Canvas::new(t.m.w, 1);
         let keys = widgets::keyboard(&mut canvas, &t, f, self.state.lang, 0.0, self.state.layer, self.state.key_held(), enter);
@@ -6749,9 +6749,14 @@ impl App {
             Touch::Down(x, y) => {
                 self.tracker.clear();
                 self.tracker.add(now, y);
+                let edge_width = self
+                    .cover_keyboard_top()
+                    .filter(|top| y >= *top)
+                    .and_then(|_| self.cover.as_ref().map(|cover| cover.full_w))
+                    .unwrap_or(m.w);
                 let side = if x < edge {
                     Some(true)
-                } else if x > m.w as f32 - edge {
+                } else if x > edge_width as f32 - edge {
                     Some(false)
                 } else {
                     None
@@ -12637,6 +12642,72 @@ mod tests {
             vec![Effect::TermInput(b"q".to_vec())],
             "the bottom edge of Q must not type the A below it"
         );
+    }
+
+    #[test]
+    fn default_cover_terminal_keyboard_hits_use_full_panel_coordinates() {
+        let (f, info) = (fonts(), info());
+        let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+        app.term = Some(term::Term::new(24, 60));
+        let samples = [
+            ((945, 395), b"q" as &[u8]),
+            ((846, 395), b"w"),
+            ((737, 397), b"e"),
+            ((623, 403), b"r"),
+            ((527, 410), b"t"),
+            ((428, 396), b"y"),
+        ];
+        for (index, (raw, expected)) in samples.into_iter().enumerate() {
+            app.frame(&f, &info);
+            let (x, y) = crate::touch::map_touch_point(
+                raw,
+                ((0, 1208), (0, 1392)),
+                (1208, 1392),
+                180,
+            );
+            let now = 10 + index as u64 * 2;
+            let mut effects = app.touch(Touch::Down(x, y), &f, now);
+            effects.extend(app.touch(Touch::Up, &f, now + 1));
+            assert_eq!(effects, vec![Effect::TermInput(expected.to_vec())], "raw point {raw:?}");
+        }
+    }
+
+    #[test]
+    fn default_cover_keyboard_hits_cover_the_entire_qwerty_row() {
+        let (f, info) = (fonts(), info());
+        let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+        app.term = Some(term::Term::new(24, 60));
+        for (index, ch) in "qwertyuiop".chars().enumerate() {
+            app.frame(&f, &info);
+            let (_, keys) = app.cover_widget_keyboard_art(&f);
+            let rect = keys.iter().find(|(_, cap)| *cap == Cap::Char(ch)).unwrap().0;
+            let top = app.cover_keyboard_top().unwrap();
+            let (x, y) = (rect.x + rect.w / 2.0, top + rect.y + rect.h / 2.0);
+            let now = 100 + index as u64 * 2;
+            let mut effects = app.touch(Touch::Down(x, y), &f, now);
+            effects.extend(app.touch(Touch::Up, &f, now + 1));
+            assert_eq!(effects, vec![Effect::TermInput(vec![ch as u8])], "visible key {ch:?}");
+        }
+    }
+
+    #[test]
+    fn cover_full_width_meta_tap_survives_small_finger_drift() {
+        let (f, info) = (fonts(), info());
+        let mut app = App::new_cover(Screen::Terminal, 1208, 1392, 520.0 / 160.0);
+        app.cover_keyboard_requested = true;
+        app.term = Some(term::Term::new(24, 60));
+        app.stack.push((Screen::Terminal, 0.0, Focus::Unset));
+        let (_, keys) = app.cover_widget_keyboard_art(&f);
+        let rect = keys.iter().find(|(_, cap)| *cap == Cap::Meta).unwrap().0;
+        let top = app.cover_keyboard_top().unwrap();
+        let (x, y) = (rect.x + rect.w / 2.0, top + rect.y + rect.h / 2.0);
+        assert!(x > app.w as f32 - app.theme().m.dp(20.0));
+        app.frame(&f, &info);
+
+        let mut effects = app.touch(Touch::Down(x, y), &f, 10);
+        effects.extend(app.touch(Touch::Move(x - 32.0, y), &f, 11));
+        effects.extend(app.touch(Touch::Up, &f, 12));
+        assert_eq!(effects, vec![Effect::TermInput(b"".to_vec())]);
     }
 
     #[test]
