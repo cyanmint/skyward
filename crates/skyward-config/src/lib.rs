@@ -959,6 +959,21 @@ mod tests {
             keymint.libraries.iter().any(|path| path == "/mnt/system/system/lib64"),
             "KeyMint needs the mounted platform system libraries to resolve VNDK dependencies"
         );
+        assert!(
+            keymint.libraries.iter().any(|path| path == "/mnt/system/system/lib64/bootstrap"),
+            "KeyMint needs bootstrap system libraries while the runtime APEX is not mounted"
+        );
+        let bootstrap = keymint
+            .libraries
+            .iter()
+            .position(|path| path == "/mnt/system/system/lib64/bootstrap")
+            .unwrap();
+        let system = keymint
+            .libraries
+            .iter()
+            .position(|path| path == "/mnt/system/system/lib64")
+            .unwrap();
+        assert!(bootstrap < system, "bootstrap libs must precede dangling runtime-APEX symlinks");
     }
 
     #[test]
