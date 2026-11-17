@@ -76,7 +76,7 @@ path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
 selinux = true
 # Match vendor init policy: this executable transitions to its QTI HAL domain.
 seclabel = "u:r:vendor_hal_keymint_qti:s0"
-libraries = ["/system/lib64", "/vendor/lib64"]
+libraries = ["/system/lib64", "/vendor/lib64", "/mnt/system/system/lib64"]
 ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
 registers = [
     "android.hardware.security.keymint.IRemotelyProvisionedComponent/default",

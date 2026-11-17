@@ -955,6 +955,10 @@ mod tests {
         assert!(keymint.registers.contains(
             &"android.hardware.security.keymint.IRemotelyProvisionedComponent/default".to_string()
         ));
+        assert!(
+            keymint.libraries.iter().any(|path| path == "/mnt/system/system/lib64"),
+            "KeyMint needs the mounted platform system libraries to resolve VNDK dependencies"
+        );
     }
 
     #[test]
