@@ -351,16 +351,50 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn inherited_control_socket_uses_android_init_environment_and_fd() -> Result<()> {
+        const CHILD_PROBE: &str = "SKYWARD_TEST_SOCKET_HANDOFF_PROBE";
+        const TEST_NAME: &str =
+            "service_socket::tests::inherited_control_socket_uses_android_init_environment_and_fd";
+        if let Some(marker) = std::env::var_os(CHILD_PROBE) {
+            let parent_pid = marker
+                .to_string_lossy()
+                .parse::<libc::pid_t>()
+                .expect("probe marker must contain the parent PID");
+            assert_eq!(
+                parent_pid,
+                unsafe { libc::getppid() },
+                "probe marker must identify the direct parent"
+            );
+            assert_eq!(
+                std::env::var_os("ANDROID_SOCKET_notify-topology").as_deref(),
+                Some(std::ffi::OsStr::new("64"))
+            );
+            assert!(fs::metadata("/proc/self/fd/64")?.file_type().is_socket());
+            return Ok(());
+        }
+
         let dir = tempfile::tempdir()?;
-        let socket = socket(dir.path())?;
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "test -S /proc/self/fd/64 && env"]);
-        let _handoff = pass_to_command(&mut command, &[socket])?;
+        let sockets = [socket(dir.path())?];
+        let mut command = Command::new(std::env::current_exe()?);
+        command.args(["--exact", TEST_NAME, "--nocapture"]);
+        command.env_remove(CHILD_PROBE);
+        command.env_remove("ANDROID_SOCKET_notify-topology");
+        command.env(CHILD_PROBE, std::process::id().to_string());
+        let handoff = pass_to_command(&mut command, &sockets)?;
         let output = command.output()?;
-        assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line == "ANDROID_SOCKET_notify-topology=64"));
+        drop(handoff);
+        let child_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "socket handoff child failed: {child_output:?}"
+        );
+        assert!(
+            child_output.contains(&format!("test {TEST_NAME} ... ok")),
+            "exact child test did not report a pass: {child_output:?}"
+        );
         Ok(())
     }
 
