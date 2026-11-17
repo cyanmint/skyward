@@ -5,6 +5,12 @@ use skyward_sys::{bcb, Power};
 use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
 
+#[cfg(all(unix, any(target_os = "android", test)))]
+#[cfg_attr(test, allow(dead_code))]
+mod service_security;
+#[cfg(all(unix, any(target_os = "android", test)))]
+mod service_socket;
+
 #[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
@@ -23,11 +29,13 @@ mod partwork;
 mod pty;
 #[cfg(target_os = "android")]
 mod readings;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(test, allow(dead_code))]
 mod relabel;
 #[cfg(target_os = "android")]
 mod secure;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(test, allow(dead_code))]
 mod services;
 #[cfg(target_os = "android")]
 mod settings;
@@ -278,10 +286,11 @@ fn main() -> Result<()> {
         Cmd::Umount => skyward_vab::unmount_partitions(booted_slot()?),
         #[cfg(target_os = "android")]
         Cmd::Services { config } => {
-            let props = skyward_info::installed_props(booted_slot()?)?;
+            let slot = booted_slot()?;
+            let props = skyward_info::installed_props(slot)?;
             let mut services = DeviceConfig::load(&config)?.services;
             services.retain(|s| s.runs_on(&props));
-            services::start(&services, secure::libraries()?.as_deref())?;
+            services::start(&services, secure::libraries()?.as_deref(), slot)?;
             loop {
                 std::thread::park();
             }
@@ -549,7 +558,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     if let Some(dir) = &libraries {
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
     }
-    services::start(&services, libraries.as_deref())?;
+    services::start(&services, libraries.as_deref(), slot)?;
     agree_on_the_notes_key(&registering)
 }
 

@@ -47,6 +47,41 @@ touch_rotation = 180
 [firmware]
 partition = "modem"
 
+# The secure world keeps files on persist, and its services need the stock
+# mount point before they start.
+[partitions]
+mounted = ["persist"]
+
+# QSEE and KeyMint are needed for hardware-wrapped data keys. Verify these
+# product-specific paths, properties, and labels against Ruyi's stock init.
+[[service]]
+path = "/vendor/bin/qseecomd"
+selinux = true
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_property = "vendor.sys.listeners.registered"
+ready_property_value = "true"
+user = "root"
+groups = ["root", "drmrpc"]
+[[service.sockets]]
+name = "notify-topology"
+type = "stream"
+mode = 0o660
+user = "system"
+group = "drmrpc"
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
+selinux = true
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
+registers = [
+    "android.hardware.security.keymint.IRemotelyProvisionedComponent/default",
+    "android.hardware.security.secureclock.ISecureClock/default",
+    "android.hardware.security.sharedsecret.ISharedSecret/default",
+]
+user = "system"
+groups = ["system", "drmrpc"]
+
 [wlan]
 modules = ["rfkill", "qca_cld3_kiwi_v2"]
 writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]

@@ -80,6 +80,7 @@ groups = ["root", "system", "wakelock", "graphics"]
 path = "/vendor/bin/qseecomd"
 libraries = ["/system/lib64", "/vendor/lib64"]
 ready_property = "vendor.sys.listeners.registered"
+ready_property_value = "true"
 user = "root"
 groups = ["root", "drmrpc"]
 

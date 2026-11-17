@@ -102,6 +102,7 @@ groups = ["system", "uhid", "input"]
 path = "/vendor/bin/qseecomd"
 libraries = ["/system/lib64", "/vendor/lib64"]
 ready_property = "vendor.sys.listeners.registered"
+ready_property_value = "true"
 user = "root"
 groups = ["root", "drmrpc"]
 
@@ -122,6 +123,7 @@ groups = ["system", "drmrpc"]
 path = "/mnt/system_ext/bin/hwservicemanager"
 libraries = ["/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
 ready_property = "hwservicemanager.ready"
+ready_property_value = "true"
 user = "system"
 groups = ["system", "readproc"]
 

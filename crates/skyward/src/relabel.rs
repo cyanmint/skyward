@@ -63,6 +63,12 @@ pub fn rule_files(slot: Slot) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// Resolve an installed system file-context rule for a path and file type.
+pub(crate) fn file_context(slot: Slot, path: &Path, mode: u32) -> Result<Option<Vec<u8>>> {
+    let rules = Rules::open(&rule_files(slot)?)?;
+    rules.lookup(path, mode)
+}
+
 #[repr(C)]
 struct SelinuxOpt {
     kind: c_int,

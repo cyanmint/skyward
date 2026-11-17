@@ -1,9 +1,11 @@
+use crate::service_security::{CreateContextOps, ServiceContext, ServiceSecurity};
 use anyhow::{bail, ensure, Context, Result};
 use procfs::process::{FDTarget, MMapPath, Process};
-use skyward_config::Service;
+use skyward_config::{Service, ServiceSocketType};
 use skyward_sys::ueventd;
-use skyward_vab::Mounted;
+use skyward_vab::{Mounted, Slot};
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -38,8 +40,22 @@ const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 ///
 /// `libraries` is a directory of shared libraries every one of them may
 /// need, searched after whatever it names itself.
-pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
-    let known = ueventd::accounts(&ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>());
+pub fn start(services: &[Service], libraries: Option<&Path>, slot: Slot) -> Result<()> {
+    let needs_selinux = services
+        .iter()
+        .any(|service| service.selinux || service.seclabel.is_some());
+    let selinux = if needs_selinux {
+        Some(ServiceSecurity::load()?)
+    } else {
+        None
+    };
+    let known = ueventd::accounts(
+        &ueventd::PASSWD_FILES
+            .iter()
+            .chain(&ueventd::GROUP_FILES)
+            .copied()
+            .collect::<Vec<_>>(),
+    );
     for s in services {
         if !Path::new(&s.path).is_file() {
             bail!("{} is missing; is its partition mounted?", s.path);
@@ -48,16 +64,109 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
         if let Some(dir) = libraries {
             s.libraries.push(dir.to_string_lossy().into_owned());
         }
+        ensure!(
+            s.selinux || s.seclabel.is_none(),
+            "{}: an explicit seclabel requires selinux = true",
+            s.path
+        );
+        let service_context = if s.selinux {
+            selinux
+                .as_ref()
+                .map(|security| security.service_context(Path::new(&s.path), s.seclabel.as_deref()))
+                .transpose()?
+        } else {
+            None
+        };
+        ensure!(
+            s.selinux || s.sockets.iter().all(|socket| socket.context.is_none()),
+            "{}: an explicit socket context requires selinux = true",
+            s.path
+        );
+        let socket_contexts = s
+            .sockets
+            .iter()
+            .map(|socket| {
+                let Some(service_context) = &service_context else {
+                    return Ok(None);
+                };
+                match socket.context.as_deref() {
+                    Some(label) => CString::new(label)
+                        .with_context(|| {
+                            format!(
+                                "{}: socket {} SELinux context contains a NUL",
+                                s.path, socket.name
+                            )
+                        })
+                        .map(Some),
+                    None => Ok(Some(service_context.label().to_owned())),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let socket_file_contexts = if let (Some(security), Some(_context)) =
+            (&selinux, &service_context)
+        {
+            s.sockets
+                .iter()
+                .map(|socket| {
+                    security.socket_file_context(slot, &Path::new("/dev/socket").join(&socket.name))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; s.sockets.len()]
+        };
         let who = Credentials::of(&s, &known)?;
+        let socket_accounts = s
+            .sockets
+            .iter()
+            .map(|socket| {
+                let uid = ueventd::account(&known, &socket.user).with_context(|| {
+                    format!("{}: the phone has no account named {}", s.path, socket.user)
+                })?;
+                let gid = ueventd::account(&known, &socket.group).with_context(|| {
+                    format!("{}: the phone has no group named {}", s.path, socket.group)
+                })?;
+                Ok((uid, gid))
+            })
+            .collect::<Result<Vec<_>>>()?;
         if s.oneshot {
-            let status = command(&s, &who).status().with_context(|| format!("run {}", s.path))?;
-            ensure!(status.success(), "{} {} ended: {status}", s.path, s.args.join(" "));
+            let sockets = bind_sockets(
+                &s,
+                &socket_accounts,
+                service_context.as_ref(),
+                &socket_contexts,
+                &socket_file_contexts,
+            )?;
+            let mut cmd = command(&s, &who, service_context.as_ref());
+            let handoff = crate::service_socket::pass_to_command(&mut cmd, &sockets)?;
+            let status = cmd.status().with_context(|| format!("run {}", s.path))?;
+            drop(handoff);
+            ensure!(
+                status.success(),
+                "{} {} ended: {status}",
+                s.path,
+                s.args.join(" ")
+            );
             skyward_sys::kmsg(&format!("ran {} {}", s.path, s.args.join(" ")))?;
             continue;
         }
         let waiting = s.clone();
-        let name = Path::new(&s.path).file_name().map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
-        thread::Builder::new().name(name).spawn(move || supervise(&s, &who)).context("start a supervising thread")?;
+        let name = Path::new(&s.path)
+            .file_name()
+            .map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
+        let service_context = service_context.clone();
+        thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                supervise(
+                    &s,
+                    &who,
+                    &socket_accounts,
+                    service_context.as_ref(),
+                    &socket_contexts,
+                    &socket_file_contexts,
+                )
+            })
+            .context("start a supervising thread")?;
         ready(&waiting)?;
     }
     Ok(())
@@ -155,18 +264,29 @@ fn set_capabilities(mask: u64) -> io::Result<()> {
     }
 }
 
+fn property_matches(value: Option<String>, expected: &str) -> bool {
+    value.as_deref() == Some(expected)
+}
+
 /// Wait until the program has what it says it will be ready with.
 fn ready(s: &Service) -> Result<()> {
-    let waited_on = match (&s.ready_property, &s.ready_service, &s.ready_hardware_service) {
-        (Some(p), _, _) => format!("set no {p}"),
+    let waited_on = match (
+        &s.ready_property,
+        &s.ready_service,
+        &s.ready_hardware_service,
+    ) {
+        (Some(p), _, _) => format!(
+            "{p}={}",
+            s.ready_property_value.as_deref().unwrap_or("<missing>")
+        ),
         (_, Some(n), _) => format!("registered no {n}"),
         (_, _, Some(n)) => format!("registered no {n}"),
         _ => return Ok(()),
     };
     let until = Instant::now() + READY_TIMEOUT;
     loop {
-        if let Some(name) = &s.ready_property {
-            if skyward_sys::prop(name).is_some_and(|v| !v.is_empty()) {
+        if let (Some(name), Some(expected)) = (&s.ready_property, &s.ready_property_value) {
+            if property_matches(skyward_sys::prop(name), expected) {
                 return Ok(());
             }
         }
@@ -183,18 +303,37 @@ fn ready(s: &Service) -> Result<()> {
             }
         }
         if Instant::now() >= until {
-            bail!("{} {waited_on} in {} seconds", s.path, READY_TIMEOUT.as_secs());
+            bail!(
+                "{} {waited_on} in {} seconds",
+                s.path,
+                READY_TIMEOUT.as_secs()
+            );
         }
         thread::sleep(READY_POLL);
     }
 }
 
-fn supervise(s: &Service, who: &Credentials) -> ! {
+fn supervise(
+    s: &Service,
+    who: &Credentials,
+    socket_accounts: &[(u32, u32)],
+    service_context: Option<&ServiceContext>,
+    socket_contexts: &[Option<CString>],
+    socket_file_contexts: &[Option<CString>],
+) -> ! {
     loop {
         let started = Instant::now();
         let ended = match running(&s.path) {
-            Some(pid) => wait_for(pid).map(|()| format!("pid {pid}, left by an earlier recovery service, exited")),
-            None => run(s, who),
+            Some(pid) => wait_for(pid)
+                .map(|()| format!("pid {pid}, left by an earlier recovery service, exited")),
+            None => run(
+                s,
+                who,
+                socket_accounts,
+                service_context,
+                socket_contexts,
+                socket_file_contexts,
+            ),
         };
         let line = match ended {
             Ok(how) => format!("{}: {how}", s.path),
@@ -208,8 +347,70 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
 }
 
 /// Start the program and wait for it to end.
-fn run(s: &Service, who: &Credentials) -> Result<String> {
-    let mut child = command(s, who).spawn().with_context(|| format!("start {}", s.path))?;
+fn bind_sockets(
+    s: &Service,
+    accounts: &[(u32, u32)],
+    service_context: Option<&ServiceContext>,
+    socket_contexts: &[Option<CString>],
+    file_contexts: &[Option<CString>],
+) -> Result<Vec<crate::service_socket::BoundSocket>> {
+    ensure!(
+        s.sockets.len() == accounts.len(),
+        "{}: socket account count does not match socket count",
+        s.path
+    );
+    ensure!(
+        s.sockets.len() == socket_contexts.len(),
+        "{}: socket context count does not match socket count",
+        s.path
+    );
+    ensure!(
+        s.sockets.len() == file_contexts.len(),
+        "{}: socket label count does not match socket count",
+        s.path
+    );
+    s.sockets
+        .iter()
+        .zip(accounts)
+        .zip(socket_contexts)
+        .zip(file_contexts)
+        .map(|(((socket, (uid, gid)), socket_context), file_context)| {
+            let context_ops = service_context.map(|context| context as &dyn CreateContextOps);
+            match socket.socket_type {
+                ServiceSocketType::Stream => crate::service_socket::BoundSocket::bind(
+                    &socket.name,
+                    Path::new("/dev/socket"),
+                    socket.mode,
+                    *uid,
+                    *gid,
+                    context_ops,
+                    socket_context.as_deref(),
+                    file_context.as_deref(),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn run(
+    s: &Service,
+    who: &Credentials,
+    socket_accounts: &[(u32, u32)],
+    service_context: Option<&ServiceContext>,
+    socket_contexts: &[Option<CString>],
+    socket_file_contexts: &[Option<CString>],
+) -> Result<String> {
+    let sockets = bind_sockets(
+        s,
+        socket_accounts,
+        service_context,
+        socket_contexts,
+        socket_file_contexts,
+    )?;
+    let mut cmd = command(s, who, service_context);
+    let handoff = crate::service_socket::pass_to_command(&mut cmd, &sockets)?;
+    let mut child = cmd.spawn().with_context(|| format!("start {}", s.path))?;
+    drop(handoff);
     let status = child.wait().context("wait for it")?;
     Ok(format!("pid {} ended: {status}", child.id()))
 }
@@ -217,16 +418,30 @@ fn run(s: &Service, who: &Credentials) -> Result<String> {
 /// The program as it is started: with what it is given, from the top of the
 /// tree, reading and writing nothing of the recovery's, finding its
 /// libraries where it names them, and as `who`.
-fn command(s: &Service, who: &Credentials) -> Command {
+fn command(s: &Service, who: &Credentials, service_context: Option<&ServiceContext>) -> Command {
     let mut cmd = Command::new(&s.path);
-    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(&s.args)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if !s.libraries.is_empty() {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
     }
     let who = who.clone();
+    let service_context = service_context.cloned();
     // Only system calls run between the fork and the exec, on what was
-    // worked out before it.
-    unsafe { cmd.pre_exec(move || who.take_on()) };
+    // worked out before it. Match init by setting the exec context after the
+    // service account and groups have been applied.
+    unsafe {
+        cmd.pre_exec(move || {
+            who.take_on()?;
+            if let Some(context) = &service_context {
+                context.set_for_exec()?;
+            }
+            Ok(())
+        });
+    }
     cmd
 }
 
@@ -288,6 +503,7 @@ fn lock(path: &Path) -> Result<()> {
 /// Whether a service has registered. The service directory may itself be
 /// starting again, and until it answers nothing is registered as far as
 /// anyone can tell.
+#[cfg(target_os = "android")]
 pub fn registered(name: &str) -> bool {
     match skyward_binder::driver::Binder::open() {
         Ok(binder) => matches!(skyward_binder::service::find(&binder, name), Ok(Some(_))),
@@ -298,6 +514,7 @@ pub fn registered(name: &str) -> bool {
 /// Whether a hardware service of the older kind has registered with the
 /// directory its kind uses. It is named as the interface and then which of
 /// them it is.
+#[cfg(target_os = "android")]
 pub fn registered_hardware(name: &str) -> bool {
     let Some((interface, instance)) = name.rsplit_once('/') else { return false };
     match skyward_binder::driver::Binder::hardware() {
@@ -308,12 +525,22 @@ pub fn registered_hardware(name: &str) -> bool {
 
 /// Whether the service directory takes calls. What it is asked about does
 /// not matter; that it answers does.
+#[cfg(target_os = "android")]
 pub fn reachable() -> bool {
     match skyward_binder::driver::Binder::open() {
         Ok(binder) => skyward_binder::service::find(&binder, "android.os.IServiceManager").is_ok(),
         Err(_) => false,
     }
 }
+
+#[cfg(all(test, not(target_os = "android")))]
+pub fn registered(_name: &str) -> bool { false }
+
+#[cfg(all(test, not(target_os = "android")))]
+pub fn registered_hardware(_name: &str) -> bool { false }
+
+#[cfg(all(test, not(target_os = "android")))]
+pub fn reachable() -> bool { false }
 
 /// A process already running `path`.
 pub fn running(path: &str) -> Option<u32> {
@@ -344,5 +571,18 @@ fn wait_for(pid: u32) -> Result<()> {
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e).context("wait on the pidfd");
         }
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::property_matches;
+
+    #[test]
+    fn readiness_requires_the_configured_property_value() {
+        assert!(property_matches(Some("true".into()), "true"));
+        assert!(!property_matches(Some("false".into()), "true"));
+        assert!(!property_matches(Some(String::new()), "true"));
+        assert!(!property_matches(None, "true"));
     }
 }

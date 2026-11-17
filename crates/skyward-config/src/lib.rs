@@ -463,6 +463,28 @@ pub struct Partitions {
     pub mounted: Vec<String>,
 }
 
+/// A stream socket the phone's init would create before starting a program,
+/// made available to it as an inherited Android control socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceSocketType {
+    Stream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ServiceSocket {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub socket_type: ServiceSocketType,
+    /// The mode init gives the socket, written as an octal number.
+    pub mode: u32,
+    pub user: String,
+    pub group: String,
+    /// An explicit init socket creation context, when the stock service uses one.
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
 /// A program from the phone's own partitions that the recovery keeps
 /// running, such as the touch processing of a panel that hands raw frames
 /// to the host.
@@ -476,6 +498,15 @@ pub struct Service {
     /// Directories for LD_LIBRARY_PATH, searched in order.
     #[serde(default)]
     pub libraries: Vec<String>,
+    /// Local sockets init creates and hands to the program as file descriptors.
+    #[serde(default)]
+    pub sockets: Vec<ServiceSocket>,
+    /// Enable init-style SELinux process and socket-label handling.
+    #[serde(default)]
+    pub selinux: bool,
+    /// An explicit init `seclabel`; used only when `selinux` is true.
+    #[serde(default)]
+    pub seclabel: Option<String>,
     /// The program runs once, to its end, as a service of init's marked
     /// oneshot does: it is not started again, the programs after it start
     /// once it has ended, and it has to end well.
@@ -486,6 +517,9 @@ pub struct Service {
     /// something to wait for holds up the ones after it.
     #[serde(default)]
     pub ready_property: Option<String>,
+    /// The exact value of the readiness property once the program is ready.
+    #[serde(default)]
+    pub ready_property_value: Option<String>,
     /// A service the program registers with the phone's service directory
     /// once it is ready.
     #[serde(default)]
@@ -690,6 +724,15 @@ impl DeviceConfig {
             );
         }
         for s in &cfg.services {
+            ensure!(
+                match (&s.ready_property, &s.ready_property_value) {
+                    (Some(_), Some(value)) => !value.is_empty(),
+                    (None, None) => true,
+                    _ => false,
+                },
+                "[[service]] {}: ready_property and a non-empty ready_property_value must be given together",
+                s.path
+            );
             ensure!(s.user.is_none() || !s.groups.is_empty(), "[[service]] {}: a program given a user is given its group too", s.path);
             for name in s.user.iter().chain(&s.groups) {
                 ensure!(!name.is_empty() && !name.contains(char::is_whitespace), "[[service]] {}: {name:?} is not an account's name", s.path);
@@ -863,6 +906,56 @@ mod tests {
     }
 
     #[test]
+    fn ruyi_declares_persist_and_keymint_services_for_data_access() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        assert_eq!(
+            config
+                .firmware
+                .as_ref()
+                .map(|firmware| firmware.partition.as_str()),
+            Some("modem")
+        );
+        assert_eq!(config.partitions.mounted, ["persist"]);
+        let [listeners, keymint, ..] = &config.services[..] else {
+            panic!("QSEE and KeyMint services are listed")
+        };
+        assert_eq!(listeners.path, "/vendor/bin/qseecomd");
+        assert!(listeners.selinux && keymint.selinux);
+        assert_eq!(
+            listeners.ready_property.as_deref(),
+            Some("vendor.sys.listeners.registered")
+        );
+        assert_eq!(listeners.ready_property_value.as_deref(), Some("true"));
+        assert_eq!(listeners.sockets.len(), 1);
+        assert_eq!(listeners.sockets[0].name, "notify-topology");
+        assert_eq!(listeners.sockets[0].socket_type, ServiceSocketType::Stream);
+        assert_eq!(listeners.sockets[0].mode, 0o660);
+        assert_eq!(listeners.sockets[0].user, "system");
+        assert_eq!(listeners.sockets[0].group, "drmrpc");
+        assert_eq!(
+            keymint.path,
+            "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
+        );
+        assert_eq!(
+            keymint.ready_service.as_deref(),
+            Some("android.hardware.security.keymint.IKeyMintDevice/default")
+        );
+        assert!(
+            keymint.registers.contains(
+                &"android.hardware.security.secureclock.ISecureClock/default".to_string()
+            )
+        );
+        assert!(
+            keymint.registers.contains(
+                &"android.hardware.security.sharedsecret.ISharedSecret/default".to_string()
+            )
+        );
+        assert!(keymint.registers.contains(
+            &"android.hardware.security.keymint.IRemotelyProvisionedComponent/default".to_string()
+        ));
+    }
+
+    #[test]
     fn display_modes_select_only_their_configured_panels() {
         let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
         let indices = |mode| {
@@ -1024,6 +1117,7 @@ mod tests {
         assert_eq!(post_boot.args, ["/vendor/bin/init.kernel.post_boot.sh"]);
         assert!(cfg.services[1..].iter().all(|s| !s.oneshot && s.args.is_empty()));
         assert_eq!(listeners.ready_property.as_deref(), Some("vendor.sys.listeners.registered"));
+        assert_eq!(listeners.ready_property_value.as_deref(), Some("true"));
         assert_eq!((opener.ready_property.as_ref(), opener.ready_service.as_ref()), (None, None));
         assert_eq!(keymint.ready_service.as_deref(), Some("android.hardware.security.keymint.IKeyMintDevice/default"));
         assert!(keymint.registers.contains(&"android.hardware.security.secureclock.ISecureClock/default".to_string()));
@@ -1074,12 +1168,22 @@ mod tests {
         let once = DeviceConfig::parse(base).unwrap();
         assert!(once.services[0].oneshot);
         assert_eq!(once.services[0].args, ["/vendor/bin/a.sh"]);
-        assert!(DeviceConfig::parse(&format!("{base}ready_property = \"vendor.a\"\n")).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}ready_property = \"vendor.a\"\nready_property_value = \"true\"\n")).is_err());
         assert!(DeviceConfig::parse(&format!("{base}ready_service = \"a.IA/default\"\n")).is_err());
         assert!(DeviceConfig::parse(&format!("{base}registers = [\"a.IB/default\"]\n")).is_err());
         assert!(DeviceConfig::parse(&format!("{base}description = \"/vendor/etc/a.xml\"\n")).is_err());
         let kept = DeviceConfig::parse("[device]\ncodename = \"x\"\n[[service]]\npath = \"/vendor/bin/a\"\n").unwrap();
         assert!(!kept.services[0].oneshot && kept.services[0].args.is_empty(), "a program is kept running unless it says otherwise");
+    }
+
+    #[test]
+    fn a_ready_property_requires_a_non_empty_expected_value() {
+        let base = "[device]\ncodename = \"x\"\n[[service]]\npath = \"/vendor/bin/a\"\n";
+        assert!(DeviceConfig::parse(&format!("{base}ready_property = \"vendor.a\"\n")).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}ready_property_value = \"true\"\n")).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}ready_property = \"vendor.a\"\nready_property_value = \"\"\n")).is_err());
+        let ready = DeviceConfig::parse(&format!("{base}ready_property = \"vendor.a\"\nready_property_value = \"true\"\n")).unwrap();
+        assert_eq!(ready.services[0].ready_property_value.as_deref(), Some("true"));
     }
 
     #[test]
@@ -1213,6 +1317,7 @@ mod tests {
         assert_eq!(cfg.services[1].libraries, ["/odm/lib64", "/system/lib64"]);
         assert_eq!(cfg.services[0].ready_property, None, "the touch programs are ready as soon as they run");
         assert_eq!(cfg.services[2].ready_property.as_deref(), Some("vendor.sys.listeners.registered"));
+        assert_eq!(cfg.services[2].ready_property_value.as_deref(), Some("true"));
         assert_eq!(
             cfg.services[3].ready_service.as_deref(),
             Some("android.hardware.security.keymint.IKeyMintDevice/default")
@@ -1222,6 +1327,7 @@ mod tests {
             Some("hwservicemanager.ready"),
             "the directory for the hardware services says so itself"
         );
+        assert_eq!(cfg.services[4].ready_property_value.as_deref(), Some("true"));
         assert_eq!(
             cfg.services[5].ready_hardware_service.as_deref(),
             Some("android.hardware.gatekeeper@1.0::IGatekeeper/default")

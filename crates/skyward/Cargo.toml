@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+libc = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
 skyward-config = { path = "../skyward-config" }
 skyward-block = { path = "../skyward-block" }
@@ -22,6 +23,8 @@ skyward-lp = { path = "../skyward-lp" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+procfs = { version = "0.18.0", default-features = false }
+skyward-files = { path = "../skyward-files" }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = { version = "0.14.3", default-features = false }
 
@@ -32,7 +35,6 @@ skyward-binder = { path = "../skyward-binder" }
 skyward-crypto = { path = "../skyward-crypto" }
 skyward-files = { path = "../skyward-files" }
 zip = { version = "8.6.0", default-features = false }
-libc = { workspace = true }
 procfs = { version = "0.18.0", default-features = false }
 skyward-ui = { path = "../skyward-ui" }
 skyward-mtp = { path = "../skyward-mtp" }
