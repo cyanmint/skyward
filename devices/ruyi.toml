@@ -57,6 +57,8 @@ mounted = ["persist"]
 [[service]]
 path = "/vendor/bin/qseecomd"
 selinux = true
+# Match stock init policy: tee_exec transitions to tee.
+seclabel = "u:r:tee:s0"
 libraries = ["/system/lib64", "/vendor/lib64"]
 ready_property = "vendor.sys.listeners.registered"
 ready_property_value = "true"
@@ -72,6 +74,8 @@ group = "drmrpc"
 [[service]]
 path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
 selinux = true
+# Match vendor init policy: this executable transitions to its QTI HAL domain.
+seclabel = "u:r:vendor_hal_keymint_qti:s0"
 libraries = ["/system/lib64", "/vendor/lib64"]
 ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
 registers = [

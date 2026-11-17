@@ -921,6 +921,8 @@ mod tests {
         };
         assert_eq!(listeners.path, "/vendor/bin/qseecomd");
         assert!(listeners.selinux && keymint.selinux);
+        assert_eq!(listeners.seclabel.as_deref(), Some("u:r:tee:s0"));
+        assert_eq!(keymint.seclabel.as_deref(), Some("u:r:vendor_hal_keymint_qti:s0"));
         assert_eq!(
             listeners.ready_property.as_deref(),
             Some("vendor.sys.listeners.registered")
