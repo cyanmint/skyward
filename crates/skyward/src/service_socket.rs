@@ -40,6 +40,13 @@ fn validate_socket_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Owner of the filesystem entry for an init-style socket.
+#[derive(Clone, Copy)]
+pub(crate) struct SocketOwner {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
 /// A Unix stream socket created for an init-style service.
 pub(crate) struct BoundSocket {
     name: String,
@@ -53,8 +60,7 @@ impl BoundSocket {
         name: &str,
         directory: &Path,
         mode: u32,
-        uid: u32,
-        gid: u32,
+        owner: SocketOwner,
         contexts: Option<&dyn CreateContextOps>,
         socket_context: Option<&CStr>,
         file_context: Option<&CStr>,
@@ -139,7 +145,7 @@ impl BoundSocket {
             .get()
             .context("bound init socket has no filesystem identity")?;
         let setup = (|| -> Result<()> {
-            set_owner_mode(&path, uid, gid, mode)?;
+            set_owner_mode(&path, owner.uid, owner.gid, mode)?;
             let result = unsafe { libc::listen(fd.as_raw_fd(), i32::MAX) };
             if result < 0 {
                 return Err(io::Error::last_os_error())
@@ -308,7 +314,7 @@ fn clear_stale_socket(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pass_to_command, BoundSocket};
+    use super::{pass_to_command, BoundSocket, SocketOwner};
     use anyhow::Result;
     use std::fs;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -319,8 +325,10 @@ mod tests {
             "notify-topology",
             dir,
             0o660,
-            unsafe { libc::geteuid() },
-            unsafe { libc::getegid() },
+            SocketOwner {
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+            },
             None,
             None,
             None,
@@ -396,8 +404,10 @@ mod tests {
             "notify-topology",
             dir.path(),
             0o660,
-            unsafe { libc::geteuid() },
-            unsafe { libc::getegid() },
+            SocketOwner {
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+            },
             Some(&ops),
             Some(&socket_context),
             Some(&file_context),
@@ -418,12 +428,30 @@ mod tests {
     #[test]
     fn refuses_paths_and_non_socket_files() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        assert!(BoundSocket::bind("../escape", dir.path(), 0o660, 0, 0, None, None, None).is_err());
+        let root = SocketOwner { uid: 0, gid: 0 };
+        assert!(BoundSocket::bind(
+            "../escape",
+            dir.path(),
+            0o660,
+            root,
+            None,
+            None,
+            None
+        )
+        .is_err());
         let path = dir.path().join("notify-topology");
         fs::write(&path, b"leave this file alone")?;
         assert!(
-            BoundSocket::bind("notify-topology", dir.path(), 0o660, 0, 0, None, None, None)
-                .is_err()
+            BoundSocket::bind(
+                "notify-topology",
+                dir.path(),
+                0o660,
+                root,
+                None,
+                None,
+                None
+            )
+            .is_err()
         );
         assert_eq!(fs::read(path)?, b"leave this file alone");
         Ok(())

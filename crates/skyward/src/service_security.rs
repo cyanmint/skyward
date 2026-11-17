@@ -304,7 +304,7 @@ impl ServiceSecurity {
         slot: skyward_vab::Slot,
         path: &Path,
     ) -> Result<Option<CString>> {
-        let Some(label) = crate::relabel::file_context(slot, path, libc::S_IFSOCK as u32)? else {
+        let Some(label) = crate::relabel::file_context(slot, path, libc::S_IFSOCK)? else {
             return Ok(None);
         };
         Ok(Some(
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn rejects_a_computed_context_without_a_domain_transition() {
-        let recovery = CStr::from_bytes_with_nul(b"u:r:recovery:s0\0").unwrap();
+        let recovery = c"u:r:recovery:s0";
         let result = transition_context(recovery, recovery);
         assert!(
             result.is_err(),
@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn accepts_the_policy_computed_service_domain() {
-        let recovery = CStr::from_bytes_with_nul(b"u:r:recovery:s0\0").unwrap();
-        let keymint = CStr::from_bytes_with_nul(b"u:r:hal_keymint_default:s0\0").unwrap();
+        let recovery = c"u:r:recovery:s0";
+        let keymint = c"u:r:hal_keymint_default:s0";
         assert_eq!(transition_context(recovery, keymint).unwrap(), keymint);
     }
 }
