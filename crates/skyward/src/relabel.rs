@@ -149,7 +149,7 @@ impl Drop for Rules {
 
 /// The label an entry carries, without the NUL it is stored with; none on
 /// an entry that has none.
-pub(crate) fn label(path: &Path) -> Result<Option<Vec<u8>>> {
+fn label(path: &Path) -> Result<Option<Vec<u8>>> {
     let c = CString::new(path.as_os_str().as_bytes()).with_context(|| format!("{} holds a NUL", path.display()))?;
     let mut buf = vec![0u8; 256];
     let n = unsafe { libc::lgetxattr(c.as_ptr(), LABEL.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
@@ -169,7 +169,7 @@ pub(crate) fn label(path: &Path) -> Result<Option<Vec<u8>>> {
 
 /// Give an entry, a link its own, the label `value`, stored with its NUL
 /// as libselinux stores one.
-pub(crate) fn set_label(path: &Path, value: &[u8]) -> Result<()> {
+fn set_label(path: &Path, value: &[u8]) -> Result<()> {
     let c = CString::new(path.as_os_str().as_bytes()).with_context(|| format!("{} holds a NUL", path.display()))?;
     if unsafe { libc::lsetxattr(c.as_ptr(), LABEL.as_ptr(), value.as_ptr().cast(), value.len(), 0) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("label {}", path.display()));
