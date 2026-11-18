@@ -32,6 +32,9 @@ mod readings;
 #[cfg(any(target_os = "android", test))]
 #[cfg_attr(test, allow(dead_code))]
 mod relabel;
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(test, allow(dead_code))]
+mod service_contexts;
 #[cfg(target_os = "android")]
 mod secure;
 #[cfg(any(target_os = "android", test))]
@@ -551,7 +554,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     registering.extend(cfg.wlan.iter().map(|w| w.service.clone()));
     let files: Vec<String> = services.iter().filter_map(|s| s.description.clone()).collect();
     if !registering.is_empty() || !files.is_empty() {
-        let described = secure::publish_descriptions(&registering, &files)?;
+        let described = secure::publish_descriptions(&registering, &files, slot)?;
         skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?;
     }
     let libraries = secure::libraries()?;

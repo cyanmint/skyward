@@ -76,8 +76,12 @@ path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
 selinux = true
 # Match vendor init policy: this executable transitions to its QTI HAL domain.
 seclabel = "u:r:vendor_hal_keymint_qti:s0"
-# Use matching mounted platform runtimes before recovery's older system libraries.
-libraries = ["/vendor/lib64", "/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/system/lib64"]
+# Keep recovery's Binder runtime ahead of mounted platform copies; they use different parcel headers.
+libraries = ["/vendor/lib64", "/system/lib64", "/mnt/system/system/lib64"]
+preloads = [
+    "/mnt/system/system/lib64/bootstrap/libdl_android.so",
+    "/mnt/system/system/lib64/libc++.so",
+]
 ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
 registers = [
     "android.hardware.security.keymint.IRemotelyProvisionedComponent/default",

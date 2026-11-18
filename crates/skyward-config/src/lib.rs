@@ -498,6 +498,9 @@ pub struct Service {
     /// Directories for LD_LIBRARY_PATH, searched in order.
     #[serde(default)]
     pub libraries: Vec<String>,
+    /// Files loaded into the process before its executable through LD_PRELOAD.
+    #[serde(default)]
+    pub preloads: Vec<String>,
     /// Local sockets init creates and hands to the program as file descriptors.
     #[serde(default)]
     pub sockets: Vec<ServiceSocket>,
@@ -620,10 +623,18 @@ pub struct Property {
 }
 
 impl Service {
-    /// Whether the program, or a directory it loads libraries from, is
-    /// under `dir`: without what is mounted there it cannot start again.
+    /// Whether the program, a library search directory, or a preloaded file
+    /// is under `dir`: without what is mounted there it cannot start again.
     pub fn uses(&self, dir: &Path) -> bool {
-        Path::new(&self.path).starts_with(dir) || self.libraries.iter().any(|l| Path::new(l).starts_with(dir))
+        Path::new(&self.path).starts_with(dir)
+            || self
+                .libraries
+                .iter()
+                .any(|path| Path::new(path).starts_with(dir))
+            || self
+                .preloads
+                .iter()
+                .any(|path| Path::new(path).starts_with(dir))
     }
 
     /// Whether the program is this phone's to run, by the installed
@@ -955,33 +966,47 @@ mod tests {
         assert!(keymint.registers.contains(
             &"android.hardware.security.keymint.IRemotelyProvisionedComponent/default".to_string()
         ));
-        assert!(
-            keymint.libraries.iter().any(|path| path == "/mnt/system/system/lib64"),
-            "KeyMint needs the mounted platform system libraries to resolve VNDK dependencies"
+        assert_eq!(
+            keymint.libraries,
+            ["/vendor/lib64", "/system/lib64", "/mnt/system/system/lib64"],
+            "recovery Binder libraries must win over the mounted system copies"
         );
-        assert!(
-            keymint.libraries.iter().any(|path| path == "/mnt/system/system/lib64/bootstrap"),
-            "KeyMint needs bootstrap system libraries while the runtime APEX is not mounted"
+        assert_eq!(
+            keymint.preloads,
+            [
+                "/mnt/system/system/lib64/bootstrap/libdl_android.so",
+                "/mnt/system/system/lib64/libc++.so"
+            ],
+            "only the matching bootstrap loader support and C++ runtime should be preloaded"
         );
-        let bootstrap = keymint
-            .libraries
-            .iter()
-            .position(|path| path == "/mnt/system/system/lib64/bootstrap")
-            .unwrap();
-        let system = keymint
-            .libraries
-            .iter()
-            .position(|path| path == "/mnt/system/system/lib64")
-            .unwrap();
-        assert!(bootstrap < system, "bootstrap libs must precede dangling runtime-APEX symlinks");
         let recovery_system = keymint
             .libraries
             .iter()
             .position(|path| path == "/system/lib64")
             .unwrap();
+        let mounted_system = keymint
+            .libraries
+            .iter()
+            .position(|path| path == "/mnt/system/system/lib64")
+            .unwrap();
         assert!(
-            system < recovery_system,
-            "mounted platform libraries must precede recovery libraries to use the matching libc++"
+            recovery_system < mounted_system,
+            "mounted system libraries must only be a fallback for recovery-missing dependencies"
+        );
+    }
+
+    #[test]
+    fn ruyi_bootstrap_loader_is_preloaded_instead_of_added_to_global_search_path() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/ruyi.toml")).unwrap();
+        let keymint = config
+            .services
+            .iter()
+            .find(|service| service.path.ends_with("keymint-service-qti"))
+            .unwrap();
+
+        assert!(
+            !keymint.libraries.iter().any(|path| path == "/mnt/system/system/lib64/bootstrap"),
+            "bootstrap loader must be explicitly preloaded, not globally preferred for every library"
         );
     }
 
@@ -1443,6 +1468,20 @@ mod tests {
         assert!(with("{ name = \"a.ini\", path = \"vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"persist\", path = \"/kiwi/mac.bin\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"by-name/persist\", path = \"mac.bin\" }").is_err());
+    }
+
+    #[test]
+    fn preloaded_libraries_keep_their_partition_in_use() {
+        let toml = r#"
+[device]
+codename = "x"
+[[service]]
+path = "/vendor/bin/keymint"
+preloads = ["/mnt/system/system/lib64/bootstrap/libdl_android.so"]
+"#;
+        let config = DeviceConfig::parse(toml).unwrap();
+
+        assert!(config.services[0].uses(Path::new("/mnt/system/system")));
     }
 
     #[test]

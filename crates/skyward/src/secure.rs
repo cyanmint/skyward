@@ -3,6 +3,7 @@
 //! service directory that knows the phone describes them.
 
 use anyhow::{ensure, Context, Result};
+use skyward_vab::Slot;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -200,7 +201,26 @@ fn image(file: &Path) -> Result<(u64, u64)> {
 /// are taken: the directory reads the whole of its description directory
 /// at once, and one file it cannot make sense of leaves it describing
 /// nothing.
-pub fn publish_descriptions(wanted: &[String], files: &[String]) -> Result<usize> {
+pub fn publish_descriptions(wanted: &[String], files: &[String], slot: Slot) -> Result<usize> {
+    let service_contexts_changed = if crate::service_contexts::uses_aidl_service_contexts(wanted) {
+        let copied = crate::service_contexts::install_platform_service_contexts()?;
+        let path = Path::new(crate::service_contexts::PLATFORM_SERVICE_CONTEXTS_TARGET);
+        let label = crate::relabel::file_context(slot, path, libc::S_IFREG as u32)?
+            .with_context(|| format!("no SELinux file-context rule for {}", path.display()))?;
+        ensure!(
+            label.last() == Some(&0),
+            "SELinux returned an unterminated file context for {}",
+            path.display()
+        );
+        let current = crate::relabel::label(path)?;
+        let label_changed = current.as_deref() != Some(&label[..label.len() - 1]);
+        if label_changed {
+            crate::relabel::set_label(path, &label)?;
+        }
+        copied || label_changed
+    } else {
+        false
+    };
     let into = Path::new(RECOVERY_DESCRIPTIONS);
     fs::create_dir_all(into).with_context(|| format!("make {}", into.display()))?;
     // Both directories read these as the users their init scripts name,
@@ -241,7 +261,7 @@ pub fn publish_descriptions(wanted: &[String], files: &[String]) -> Result<usize
         take(from, &fs::read_to_string(from).with_context(|| format!("read {file}"))?)?;
     }
     let rewritten = say_framework(into)?;
-    if copied > 0 || rewritten > 0 {
+    if copied > 0 || rewritten > 0 || service_contexts_changed {
         // The directory reads the descriptions once and keeps to them, so
         // it has to start again to see these. It comes back knowing nothing
         // of what had registered with it, and nothing registers again by

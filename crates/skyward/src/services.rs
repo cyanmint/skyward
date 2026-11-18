@@ -427,6 +427,9 @@ fn command(s: &Service, who: &Credentials, service_context: Option<&ServiceConte
     if !s.libraries.is_empty() {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
     }
+    if !s.preloads.is_empty() {
+        cmd.env("LD_PRELOAD", s.preloads.join(":"));
+    }
     let who = who.clone();
     let service_context = service_context.cloned();
     // Only system calls run between the fork and the exec, on what was
@@ -583,5 +586,39 @@ mod property_tests {
         assert!(!property_matches(Some("false".into()), "true"));
         assert!(!property_matches(Some(String::new()), "true"));
         assert!(!property_matches(None, "true"));
+    }
+
+    #[test]
+    fn command_passes_the_configured_keymint_preload() {
+        use super::{command, Credentials};
+        use std::ffi::OsStr;
+
+        let config =
+            skyward_config::DeviceConfig::parse(include_str!("../../../devices/ruyi.toml"))
+                .unwrap();
+        let keymint = config
+            .services
+            .iter()
+            .find(|service| service.path.ends_with("keymint-service-qti"))
+            .unwrap();
+        let who = Credentials {
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+            kept: None,
+        };
+        let command = command(keymint, &who, None);
+        let preload = command.get_envs().find_map(|(name, value)| {
+            (name == OsStr::new("LD_PRELOAD"))
+                .then_some(value)
+                .flatten()
+        });
+
+        assert_eq!(
+            preload,
+            Some(OsStr::new(
+                "/mnt/system/system/lib64/bootstrap/libdl_android.so:/mnt/system/system/lib64/libc++.so"
+            ))
+        );
     }
 }
