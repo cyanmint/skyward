@@ -974,6 +974,15 @@ mod tests {
             .position(|path| path == "/mnt/system/system/lib64")
             .unwrap();
         assert!(bootstrap < system, "bootstrap libs must precede dangling runtime-APEX symlinks");
+        let recovery_system = keymint
+            .libraries
+            .iter()
+            .position(|path| path == "/system/lib64")
+            .unwrap();
+        assert!(
+            system < recovery_system,
+            "mounted platform libraries must precede recovery libraries to use the matching libc++"
+        );
     }
 
     #[test]
